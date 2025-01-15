@@ -10,7 +10,7 @@ import { IncomingMessage } from 'http'
 import * as ComAtprotoLabelDefs from './defs'
 
 export interface QueryParams {
-  /** The last known event to backfill from. */
+  /** The last known event seq number to backfill from. */
   cursor?: number
 }
 
@@ -20,12 +20,15 @@ export type OutputSchema =
   | { $type: string; [k: string]: unknown }
 export type HandlerError = ErrorFrame<'FutureCursor'>
 export type HandlerOutput = HandlerError | OutputSchema
-export type Handler<HA extends HandlerAuth = never> = (ctx: {
+export type HandlerReqCtx<HA extends HandlerAuth = never> = {
   auth: HA
   params: QueryParams
   req: IncomingMessage
   signal: AbortSignal
-}) => AsyncIterable<HandlerOutput>
+}
+export type Handler<HA extends HandlerAuth = never> = (
+  ctx: HandlerReqCtx<HA>,
+) => AsyncIterable<HandlerOutput>
 
 export interface Labels {
   seq: number

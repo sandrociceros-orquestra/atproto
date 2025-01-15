@@ -1,8 +1,8 @@
+import { setImmediate } from 'node:timers/promises'
 import { CID } from 'multiformats/cid'
 import * as cbor from '@ipld/dag-cbor'
-import { CarReader } from '@ipld/car/reader'
+import { CarBlockIterator } from '@ipld/car/iterator'
 import { BlockWriter, CarWriter } from '@ipld/car/writer'
-import { Block as CarBlock } from '@ipld/car/api'
 import {
   streamToBuffer,
   verifyCidForBytes,
@@ -10,29 +10,28 @@ import {
   check,
   schema,
   cidForCbor,
+  byteIterableToStream,
+  TID,
 } from '@atproto/common'
 import { ipldToLex, lexToIpld, LexValue, RepoRecord } from '@atproto/lexicon'
 
 import * as crypto from '@atproto/crypto'
-import Repo from './repo'
-import { MST } from './mst'
 import DataDiff from './data-diff'
-import { RepoStorage } from './storage'
 import {
+  CarBlock,
   Commit,
+  LegacyV2Commit,
   RecordCreateDescript,
   RecordDeleteDescript,
   RecordPath,
   RecordUpdateDescript,
   RecordWriteDescript,
   UnsignedCommit,
-  WriteLog,
   WriteOpAction,
 } from './types'
 import BlockMap from './block-map'
-import { MissingBlocksError } from './error'
-import * as parse from './parse'
 import { Keypair } from '@atproto/crypto'
+import { Readable } from 'stream'
 
 export async function* verifyIncomingCarBlocks(
   car: AsyncIterable<CarBlock>,
@@ -43,16 +42,31 @@ export async function* verifyIncomingCarBlocks(
   }
 }
 
-export const writeCar = (
+// we have to turn the car writer output into a stream in order to properly handle errors
+export function writeCarStream(
   root: CID | null,
   fn: (car: BlockWriter) => Promise<void>,
-): AsyncIterable<Uint8Array> => {
+): Readable {
   const { writer, out } =
     root !== null ? CarWriter.create(root) : CarWriter.create()
 
-  fn(writer).finally(() => writer.close())
+  const stream = byteIterableToStream(out)
+  fn(writer)
+    .catch((err) => {
+      stream.destroy(err)
+    })
+    .finally(() => writer.close())
+  return stream
+}
 
-  return out
+export async function* writeCar(
+  root: CID | null,
+  fn: (car: BlockWriter) => Promise<void>,
+): AsyncIterable<Uint8Array> {
+  const stream = writeCarStream(root, fn)
+  for await (const chunk of stream) {
+    yield chunk
+  }
 }
 
 export const blocksToCarStream = (
@@ -74,19 +88,32 @@ export const blocksToCarFile = (
   return streamToBuffer(carStream)
 }
 
-export const readCar = async (
-  bytes: Uint8Array,
+export const carToBlocks = async (
+  car: CarBlockIterator,
 ): Promise<{ roots: CID[]; blocks: BlockMap }> => {
-  const car = await CarReader.fromBytes(bytes)
   const roots = await car.getRoots()
   const blocks = new BlockMap()
-  for await (const block of verifyIncomingCarBlocks(car.blocks())) {
-    await blocks.set(block.cid, block.bytes)
+  for await (const block of verifyIncomingCarBlocks(car)) {
+    blocks.set(block.cid, block.bytes)
+    // break up otherwise "synchronous" work in car parsing
+    await setImmediate()
   }
   return {
     roots,
     blocks,
   }
+}
+
+export const readCar = async (
+  bytes: Uint8Array,
+): Promise<{ roots: CID[]; blocks: BlockMap }> => {
+  const car = await CarBlockIterator.fromBytes(bytes)
+  return carToBlocks(car)
+}
+
+export const readCarStream = async (stream: AsyncIterable<Uint8Array>) => {
+  const car = await CarBlockIterator.fromIterable(stream)
+  return carToBlocks(car)
 }
 
 export const readCarWithRoot = async (
@@ -103,59 +130,27 @@ export const readCarWithRoot = async (
   }
 }
 
-export const getWriteLog = async (
-  storage: RepoStorage,
-  latest: CID,
-  earliest: CID | null,
-): Promise<WriteLog> => {
-  const commits = await storage.getCommitPath(latest, earliest)
-  if (!commits) throw new Error('Could not find shared history')
-  const heads = await Promise.all(commits.map((c) => Repo.load(storage, c)))
-  // Turn commit path into list of diffs
-  let prev = await MST.create(storage) // Empty
-  const msts = heads.map((h) => h.data)
-  const diffs: DataDiff[] = []
-  for (const mst of msts) {
-    diffs.push(await DataDiff.of(mst, prev))
-    prev = mst
-  }
-  const fullDiff = collapseDiffs(diffs)
-  const diffBlocks = await storage.getBlocks(fullDiff.newCidList())
-  if (diffBlocks.missing.length > 0) {
-    throw new MissingBlocksError('write op log', diffBlocks.missing)
-  }
-  // Map MST diffs to write ops
-  return Promise.all(
-    diffs.map((diff) => diffToWriteDescripts(diff, diffBlocks.blocks)),
-  )
-}
-
 export const diffToWriteDescripts = (
   diff: DataDiff,
-  blocks: BlockMap,
 ): Promise<RecordWriteDescript[]> => {
   return Promise.all([
     ...diff.addList().map(async (add) => {
       const { collection, rkey } = parseDataKey(add.key)
-      const value = await parse.getAndParseRecord(blocks, add.cid)
       return {
         action: WriteOpAction.Create,
         collection,
         rkey,
         cid: add.cid,
-        record: value.record,
       } as RecordCreateDescript
     }),
     ...diff.updateList().map(async (upd) => {
       const { collection, rkey } = parseDataKey(upd.key)
-      const value = await parse.getAndParseRecord(blocks, upd.cid)
       return {
         action: WriteOpAction.Update,
         collection,
         rkey,
         cid: upd.cid,
         prev: upd.prev,
-        record: value.record,
       } as RecordUpdateDescript
     }),
     ...diff.deleteList().map((del) => {
@@ -170,55 +165,18 @@ export const diffToWriteDescripts = (
   ])
 }
 
-export const collapseWriteLog = (log: WriteLog): RecordWriteDescript[] => {
-  const creates: Record<string, RecordCreateDescript> = {}
-  const updates: Record<string, RecordUpdateDescript> = {}
-  const deletes: Record<string, RecordDeleteDescript> = {}
-  for (const commit of log) {
-    for (const op of commit) {
-      const key = op.collection + '/' + op.rkey
-      if (op.action === WriteOpAction.Create) {
-        const del = deletes[key]
-        if (del) {
-          if (del.cid !== op.cid) {
-            updates[key] = {
-              ...op,
-              action: WriteOpAction.Update,
-              prev: del.cid,
-            }
-          }
-          delete deletes[key]
-        } else {
-          creates[key] = op
-        }
-      } else if (op.action === WriteOpAction.Update) {
-        updates[key] = op
-        delete creates[key]
-        delete deletes[key]
-      } else if (op.action === WriteOpAction.Delete) {
-        if (creates[key]) {
-          delete creates[key]
-        } else {
-          delete updates[key]
-          deletes[key] = op
-        }
-      } else {
-        throw new Error(`unknown action: ${op}`)
-      }
+export const ensureCreates = (
+  descripts: RecordWriteDescript[],
+): RecordCreateDescript[] => {
+  const creates: RecordCreateDescript[] = []
+  for (const descript of descripts) {
+    if (descript.action !== WriteOpAction.Create) {
+      throw new Error(`Unexpected action: ${descript.action}`)
+    } else {
+      creates.push(descript)
     }
   }
-  return [
-    ...Object.values(creates),
-    ...Object.values(updates),
-    ...Object.values(deletes),
-  ]
-}
-
-export const collapseDiffs = (diffs: DataDiff[]): DataDiff => {
-  return diffs.reduce((acc, cur) => {
-    acc.addDiff(cur)
-    return acc
-  }, new DataDiff())
+  return creates
 }
 
 export const parseDataKey = (key: string): RecordPath => {
@@ -270,4 +228,16 @@ export const cborToLexRecord = (val: Uint8Array): RepoRecord => {
 
 export const cidForRecord = async (val: LexValue) => {
   return cidForCbor(lexToIpld(val))
+}
+
+export const ensureV3Commit = (commit: LegacyV2Commit | Commit): Commit => {
+  if (commit.version === 3) {
+    return commit
+  } else {
+    return {
+      ...commit,
+      version: 3,
+      rev: commit.rev ?? TID.nextStr(),
+    }
+  }
 }

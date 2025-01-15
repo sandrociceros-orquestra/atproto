@@ -3,13 +3,19 @@
   "id": "com.atproto.sync.notifyOfUpdate",
   "defs": {
     "main": {
-      "type": "query",
-      "description": "Notify a crawling service of a recent update. Often when a long break between updates causes the connection with the crawling service to break.",
-      "parameters": {
-        "type": "params",
-        "required": ["hostname"],
-        "properties": {
-          "hostname": {"type": "string", "description": "Hostname of the service that is notifying of update."}
+      "type": "procedure",
+      "description": "Notify a crawling service of a recent update, and that crawling should resume. Intended use is after a gap between repo stream events caused the crawling service to disconnect. Does not require auth; implemented by Relay.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["hostname"],
+          "properties": {
+            "hostname": {
+              "type": "string",
+              "description": "Hostname of the current service (usually a PDS) that is notifying of update."
+            }
+          }
         }
       }
     }

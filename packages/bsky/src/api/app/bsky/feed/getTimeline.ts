@@ -1,65 +1,122 @@
-import { InvalidRequestError } from '@atproto/xrpc-server'
 import { Server } from '../../../../lexicon'
-import { FeedAlgorithm, FeedKeyset, composeFeed } from '../util/feed'
-import { paginate } from '../../../../db/pagination'
 import AppContext from '../../../../context'
+import { QueryParams } from '../../../../lexicon/types/app/bsky/feed/getTimeline'
+import { clearlyBadCursor, resHeaders } from '../../../util'
+import { createPipeline } from '../../../../pipeline'
+import {
+  HydrateCtx,
+  HydrationState,
+  Hydrator,
+} from '../../../../hydration/hydrator'
+import { Views } from '../../../../views'
+import { DataPlaneClient } from '../../../../data-plane'
+import { parseString } from '../../../../hydration/util'
+import { mapDefined } from '@atproto/common'
+import { FeedItem } from '../../../../hydration/feed'
 
-// @TODO getTimeline() will be replaced by composeTimeline() in the app-view
 export default function (server: Server, ctx: AppContext) {
+  const getTimeline = createPipeline(
+    skeleton,
+    hydration,
+    noBlocksOrMutes,
+    presentation,
+  )
   server.app.bsky.feed.getTimeline({
-    auth: ctx.authVerifier,
-    handler: async ({ params, auth }) => {
-      const { algorithm, limit, cursor } = params
-      const db = ctx.db.db
-      const { ref } = db.dynamic
-      const requester = auth.credentials.did
+    auth: ctx.authVerifier.standard,
+    handler: async ({ params, auth, req }) => {
+      const viewer = auth.credentials.iss
+      const labelers = ctx.reqLabelers(req)
+      const hydrateCtx = await ctx.hydrator.createContext({ labelers, viewer })
 
-      if (algorithm && algorithm !== FeedAlgorithm.ReverseChronological) {
-        throw new InvalidRequestError(`Unsupported algorithm: ${algorithm}`)
-      }
-
-      const feedService = ctx.services.feed(ctx.db)
-      const labelService = ctx.services.label(ctx.db)
-
-      const followingIdsSubquery = db
-        .selectFrom('follow')
-        .select('follow.subjectDid')
-        .where('follow.creator', '=', requester)
-
-      // @NOTE mutes applied on pds
-      let feedItemsQb = feedService
-        .selectFeedItemQb()
-        .where((qb) =>
-          qb
-            .where('originatorDid', '=', requester)
-            .orWhere('originatorDid', 'in', followingIdsSubquery),
-        )
-
-      const keyset = new FeedKeyset(
-        ref('feed_item.sortAt'),
-        ref('feed_item.cid'),
+      const result = await getTimeline(
+        { ...params, hydrateCtx: hydrateCtx.copy({ viewer }) },
+        ctx,
       )
 
-      feedItemsQb = paginate(feedItemsQb, {
-        limit,
-        cursor,
-        keyset,
-      })
-      const feedItems = await feedItemsQb.execute()
-      const feed = await composeFeed(
-        feedService,
-        labelService,
-        feedItems,
-        requester,
-      )
+      const repoRev = await ctx.hydrator.actor.getRepoRevSafe(viewer)
 
       return {
         encoding: 'application/json',
-        body: {
-          feed,
-          cursor: keyset.packFromResult(feedItems),
-        },
+        body: result,
+        headers: resHeaders({ labelers: hydrateCtx.labelers, repoRev }),
       }
     },
   })
+}
+
+export const skeleton = async (inputs: {
+  ctx: Context
+  params: Params
+}): Promise<Skeleton> => {
+  const { ctx, params } = inputs
+  if (clearlyBadCursor(params.cursor)) {
+    return { items: [] }
+  }
+  const res = await ctx.dataplane.getTimeline({
+    actorDid: params.hydrateCtx.viewer,
+    limit: params.limit,
+    cursor: params.cursor,
+  })
+  return {
+    items: res.items.map((item) => ({
+      post: { uri: item.uri, cid: item.cid || undefined },
+      repost: item.repost
+        ? { uri: item.repost, cid: item.repostCid || undefined }
+        : undefined,
+    })),
+    cursor: parseString(res.cursor),
+  }
+}
+
+const hydration = async (inputs: {
+  ctx: Context
+  params: Params
+  skeleton: Skeleton
+}): Promise<HydrationState> => {
+  const { ctx, params, skeleton } = inputs
+  return ctx.hydrator.hydrateFeedItems(skeleton.items, params.hydrateCtx)
+}
+
+const noBlocksOrMutes = (inputs: {
+  ctx: Context
+  skeleton: Skeleton
+  hydration: HydrationState
+}): Skeleton => {
+  const { ctx, skeleton, hydration } = inputs
+  skeleton.items = skeleton.items.filter((item) => {
+    const bam = ctx.views.feedItemBlocksAndMutes(item, hydration)
+    return (
+      !bam.authorBlocked &&
+      !bam.authorMuted &&
+      !bam.originatorBlocked &&
+      !bam.originatorMuted &&
+      !bam.ancestorAuthorBlocked
+    )
+  })
+  return skeleton
+}
+
+const presentation = (inputs: {
+  ctx: Context
+  skeleton: Skeleton
+  hydration: HydrationState
+}) => {
+  const { ctx, skeleton, hydration } = inputs
+  const feed = mapDefined(skeleton.items, (item) =>
+    ctx.views.feedViewPost(item, hydration),
+  )
+  return { feed, cursor: skeleton.cursor }
+}
+
+type Context = {
+  hydrator: Hydrator
+  views: Views
+  dataplane: DataPlaneClient
+}
+
+type Params = QueryParams & { hydrateCtx: HydrateCtx & { viewer: string } }
+
+type Skeleton = {
+  items: FeedItem[]
+  cursor?: string
 }

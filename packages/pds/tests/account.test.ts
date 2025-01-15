@@ -1,15 +1,11 @@
-import { once, EventEmitter } from 'events'
-import AtpAgent, {
-  ComAtprotoServerCreateAccount,
-  ComAtprotoServerResetPassword,
-} from '@atproto/api'
-import { DidResolver } from '@atproto/did-resolver'
+import { AtpAgent, ComAtprotoServerResetPassword } from '@atproto/api'
 import * as crypto from '@atproto/crypto'
+import { TestNetworkNoAppView } from '@atproto/dev-env'
+import { IdResolver } from '@atproto/identity'
+import { EventEmitter, once } from 'events'
 import Mail from 'nodemailer/lib/mailer'
-import { AppContext, Database } from '../src'
-import * as util from './_util'
+import { AppContext } from '../src'
 import { ServerMailer } from '../src/mailer'
-import { DAY } from '@atproto/common'
 
 const email = 'alice@test.com'
 const handle = 'alice.test'
@@ -17,49 +13,30 @@ const password = 'test123'
 const passwordAlt = 'test456'
 const minsToMs = 60 * 1000
 
-const createInviteCode = async (
-  agent: AtpAgent,
-  uses: number,
-  forUser?: string,
-): Promise<string> => {
-  const res = await agent.api.com.atproto.server.createInviteCode(
-    { useCount: uses, forUser },
-    {
-      headers: { authorization: util.adminAuth() },
-      encoding: 'application/json',
-    },
-  )
-  return res.data.code
-}
-
 describe('account', () => {
-  let serverUrl: string
+  let network: TestNetworkNoAppView
   let ctx: AppContext
-  let repoSigningKey: string
   let agent: AtpAgent
-  let close: util.CloseFn
   let mailer: ServerMailer
-  let db: Database
-  let didResolver: DidResolver
+  let idResolver: IdResolver
   const mailCatcher = new EventEmitter()
   let _origSendMail
 
   beforeAll(async () => {
-    const server = await util.runTestServer({
-      inviteRequired: true,
-      userInviteInterval: DAY,
-      termsOfServiceUrl: 'https://example.com/tos',
-      privacyPolicyUrl: '/privacy-policy',
+    network = await TestNetworkNoAppView.create({
       dbPostgresSchema: 'account',
+      pds: {
+        contactEmailAddress: 'abuse@example.com',
+        termsOfServiceUrl: 'https://example.com/tos',
+        privacyPolicyUrl: 'https://example.com/privacy-policy',
+      },
     })
-    close = server.close
-    mailer = server.ctx.mailer
-    db = server.ctx.db
-    ctx = server.ctx
-    serverUrl = server.url
-    repoSigningKey = server.ctx.repoSigningKey.did()
-    didResolver = new DidResolver({ plcUrl: ctx.cfg.didPlcUrl })
-    agent = new AtpAgent({ service: serverUrl })
+    // @ts-expect-error Error due to circular dependency with the dev-env package
+    mailer = network.pds.ctx.mailer
+    // @ts-expect-error Error due to circular dependency with the dev-env package
+    ctx = network.pds.ctx
+    idResolver = network.pds.ctx.idResolver
+    agent = network.pds.getClient()
 
     // Catch emails for use in tests
     _origSendMail = mailer.transporter.sendMail
@@ -72,31 +49,19 @@ describe('account', () => {
 
   afterAll(async () => {
     mailer.transporter.sendMail = _origSendMail
-    if (close) {
-      await close()
-    }
-  })
-
-  let inviteCode: string
-
-  it('creates an invite code', async () => {
-    inviteCode = await createInviteCode(agent, 1)
-    const split = inviteCode.split('-')
-    const host = split.slice(0, -2).join('.')
-    const code = split.slice(-2).join('-')
-    expect(host).toBe('pds.public.url') // Hostname of public url
-    expect(code.length).toBe(11)
+    await network.close()
   })
 
   it('serves the accounts system config', async () => {
     const res = await agent.api.com.atproto.server.describeServer({})
-    expect(res.data.inviteCodeRequired).toBe(true)
+    expect(res.data.inviteCodeRequired).toBe(false)
     expect(res.data.availableUserDomains[0]).toBe('.test')
     expect(typeof res.data.inviteCodeRequired).toBe('boolean')
     expect(res.data.links?.privacyPolicy).toBe(
-      'https://pds.public.url/privacy-policy',
+      'https://example.com/privacy-policy',
     )
     expect(res.data.links?.termsOfService).toBe('https://example.com/tos')
+    expect(res.data.contact?.email).toBe('abuse@example.com')
   })
 
   it('fails on invalid handles', async () => {
@@ -104,21 +69,30 @@ describe('account', () => {
       email: 'bad-handle@test.com',
       handle: 'did:bad-handle.test',
       password: 'asdf',
-      inviteCode,
     })
     await expect(promise).rejects.toThrow('Input/handle must be a valid handle')
   })
 
-  it('fails on bad invite code', async () => {
-    const promise = agent.api.com.atproto.server.createAccount({
-      email,
-      handle,
-      password,
-      inviteCode: 'fake-invite',
+  describe('email validation', () => {
+    it('succeeds on allowed emails', async () => {
+      const promise = agent.api.com.atproto.server.createAccount({
+        email: 'ok-email@gmail.com',
+        handle: 'ok-email.test',
+        password: 'asdf',
+      })
+      await expect(promise).resolves.toBeTruthy()
     })
-    await expect(promise).rejects.toThrow(
-      ComAtprotoServerCreateAccount.InvalidInviteCodeError,
-    )
+
+    it('fails on disallowed emails', async () => {
+      const promise = agent.api.com.atproto.server.createAccount({
+        email: 'bad-email@disposeamail.com',
+        handle: 'bad-email.test',
+        password: 'asdf',
+      })
+      await expect(promise).rejects.toThrow(
+        'This email address is not supported, please use a different email.',
+      )
+    })
   })
 
   let did: string
@@ -129,7 +103,6 @@ describe('account', () => {
       email,
       handle,
       password,
-      inviteCode,
     })
     did = res.data.did
     jwt = res.data.accessJwt
@@ -140,22 +113,21 @@ describe('account', () => {
   })
 
   it('generates a properly formatted PLC DID', async () => {
-    const didData = await didResolver.resolveAtprotoData(did)
+    const didData = await idResolver.did.resolveAtprotoData(did)
+    const signingKey = await network.pds.ctx.actorStore.keypair(did)
 
     expect(didData.did).toBe(did)
     expect(didData.handle).toBe(handle)
-    expect(didData.signingKey).toBe(repoSigningKey)
-    expect(didData.pds).toBe('https://pds.public.url') // Mapped from publicUrl
+    expect(didData.signingKey).toBe(signingKey.did())
+    expect(didData.pds).toBe(network.pds.url)
   })
 
   it('allows a custom set recovery key', async () => {
-    const inviteCode = await createInviteCode(agent, 1)
-    const recoveryKey = (await crypto.EcdsaKeypair.create()).did()
+    const recoveryKey = (await crypto.P256Keypair.create()).did()
     const res = await agent.api.com.atproto.server.createAccount({
       email: 'custom-recovery@test.com',
       handle: 'custom-recovery.test',
       password: 'custom-recovery',
-      inviteCode,
       recoveryKey,
     })
 
@@ -163,10 +135,105 @@ describe('account', () => {
 
     expect(didData.rotationKeys).toEqual([
       recoveryKey,
-      ctx.cfg.recoveryKey,
+      ctx.cfg.identity.recoveryDidKey,
       ctx.plcRotationKey.did(),
     ])
   })
+
+  // @NOTE currently disabled until we allow a user to resver a keypair before migration
+  // it('allows a user to bring their own DID', async () => {
+  //   const userKey = await crypto.Secp256k1Keypair.create()
+  //   const handle = 'byo-did.test'
+  //   const did = await ctx.plcClient.createDid({
+  //     signingKey: ctx.repoSigningKey.did(),
+  //     handle,
+  //     rotationKeys: [
+  //       userKey.did(),
+  //       ctx.cfg.identity.recoveryDidKey ?? '',
+  //       ctx.plcRotationKey.did(),
+  //     ],
+  //     pds: network.pds.url,
+  //     signer: userKey,
+  //   })
+
+  //   const res = await agent.api.com.atproto.server.createAccount({
+  //     email: 'byo-did@test.com',
+  //     handle,
+  //     did,
+  //     password: 'byo-did-pass',
+  //   })
+
+  //   expect(res.data.handle).toEqual(handle)
+  //   expect(res.data.did).toEqual(did)
+  // })
+
+  // it('requires that the did a user brought be correctly set up for the server', async () => {
+  //   const userKey = await crypto.Secp256k1Keypair.create()
+  //   const baseDidInfo = {
+  //     signingKey: ctx.repoSigningKey.did(),
+  //     handle: 'byo-did.test',
+  //     rotationKeys: [
+  //       userKey.did(),
+  //       ctx.cfg.identity.recoveryDidKey ?? '',
+  //       ctx.plcRotationKey.did(),
+  //     ],
+  //     pds: ctx.cfg.service.publicUrl,
+  //     signer: userKey,
+  //   }
+  //   const baseAccntInfo = {
+  //     email: 'byo-did@test.com',
+  //     handle: 'byo-did.test',
+  //     password: 'byo-did-pass',
+  //   }
+
+  //   const did1 = await ctx.plcClient.createDid({
+  //     ...baseDidInfo,
+  //     handle: 'different-handle.test',
+  //   })
+  //   const attempt1 = agent.api.com.atproto.server.createAccount({
+  //     ...baseAccntInfo,
+  //     did: did1,
+  //   })
+  //   await expect(attempt1).rejects.toThrow(
+  //     'provided handle does not match DID document handle',
+  //   )
+
+  //   const did2 = await ctx.plcClient.createDid({
+  //     ...baseDidInfo,
+  //     pds: 'https://other-pds.com',
+  //   })
+  //   const attempt2 = agent.api.com.atproto.server.createAccount({
+  //     ...baseAccntInfo,
+  //     did: did2,
+  //   })
+  //   await expect(attempt2).rejects.toThrow(
+  //     'DID document pds endpoint does not match service endpoint',
+  //   )
+
+  //   const did3 = await ctx.plcClient.createDid({
+  //     ...baseDidInfo,
+  //     rotationKeys: [userKey.did()],
+  //   })
+  //   const attempt3 = agent.api.com.atproto.server.createAccount({
+  //     ...baseAccntInfo,
+  //     did: did3,
+  //   })
+  //   await expect(attempt3).rejects.toThrow(
+  //     'PLC DID does not include service rotation key',
+  //   )
+
+  //   const did4 = await ctx.plcClient.createDid({
+  //     ...baseDidInfo,
+  //     signingKey: userKey.did(),
+  //   })
+  //   const attempt4 = agent.api.com.atproto.server.createAccount({
+  //     ...baseAccntInfo,
+  //     did: did4,
+  //   })
+  //   await expect(attempt4).rejects.toThrow(
+  //     'DID document signing key does not match service signing key',
+  //   )
+  // })
 
   it('allows administrative email updates', async () => {
     await agent.api.com.atproto.admin.updateAccountEmail(
@@ -176,11 +243,11 @@ describe('account', () => {
       },
       {
         encoding: 'application/json',
-        headers: { authorization: util.adminAuth() },
+        headers: network.pds.adminAuthHeaders(),
       },
     )
 
-    const accnt = await ctx.services.account(ctx.db).getAccount(handle)
+    const accnt = await ctx.accountManager.getAccount(handle)
     expect(accnt?.email).toBe('alice-new@test.com')
 
     await agent.api.com.atproto.admin.updateAccountEmail(
@@ -190,30 +257,15 @@ describe('account', () => {
       },
       {
         encoding: 'application/json',
-        headers: { authorization: util.adminAuth() },
+        headers: network.pds.adminAuthHeaders(),
       },
     )
 
-    const accnt2 = await ctx.services.account(ctx.db).getAccount(handle)
+    const accnt2 = await ctx.accountManager.getAccount(handle)
     expect(accnt2?.email).toBe(email)
   })
 
-  it('disallows non-admin moderators to perform email updates', async () => {
-    const attemptUpdate = agent.api.com.atproto.admin.updateAccountEmail(
-      {
-        account: handle,
-        email: 'new@email.com',
-      },
-      {
-        encoding: 'application/json',
-        headers: { authorization: util.moderatorAuth() },
-      },
-    )
-    await expect(attemptUpdate).rejects.toThrow('Authentication Required')
-  })
-
   it('disallows duplicate email addresses and handles', async () => {
-    const inviteCode = await createInviteCode(agent, 2)
     const email = 'bob@test.com'
     const handle = 'bob.test'
     const password = 'test123'
@@ -221,7 +273,6 @@ describe('account', () => {
       email,
       handle,
       password,
-      inviteCode,
     })
 
     await expect(
@@ -229,7 +280,6 @@ describe('account', () => {
         email: email.toUpperCase(),
         handle: 'carol.test',
         password,
-        inviteCode,
       }),
     ).rejects.toThrow('Email already taken: BOB@TEST.COM')
 
@@ -238,19 +288,16 @@ describe('account', () => {
         email: 'carol@test.com',
         handle: handle.toUpperCase(),
         password,
-        inviteCode,
       }),
     ).rejects.toThrow('Handle already taken: bob.test')
   })
 
   it('disallows improperly formatted handles', async () => {
-    const inviteCode = await createInviteCode(agent, 1)
     const tryHandle = async (handle: string) => {
       await agent.api.com.atproto.server.createAccount({
         email: 'john@test.com',
         handle,
         password: 'test123',
-        inviteCode,
       })
     }
     await expect(tryHandle('did:john')).rejects.toThrow(
@@ -291,66 +338,19 @@ describe('account', () => {
     await expect(tryHandle('atp.test')).rejects.toThrow('Reserved handle')
   })
 
-  it('fails on used up invite code', async () => {
-    const promise = agent.api.com.atproto.server.createAccount({
-      email: 'bob@test.com',
-      handle: 'bob.test',
-      password: 'asdf',
-      inviteCode,
-    })
-    await expect(promise).rejects.toThrow(
-      ComAtprotoServerCreateAccount.InvalidInviteCodeError,
-    )
-  })
-
-  it('handles racing invite code uses', async () => {
-    const inviteCode = await createInviteCode(agent, 1)
-    const COUNT = 10
-
-    let successes = 0
-    let failures = 0
-    const promises: Promise<unknown>[] = []
-    for (let i = 0; i < COUNT; i++) {
-      const attempt = async () => {
-        try {
-          await agent.api.com.atproto.server.createAccount({
-            email: `user${i}@test.com`,
-            handle: `user${i}.test`,
-            password: `password`,
-            inviteCode,
-          })
-          successes++
-        } catch (err) {
-          failures++
-        }
-      }
-      promises.push(attempt())
-    }
-    await Promise.all(promises)
-    expect(successes).toBe(1)
-    expect(failures).toBe(9)
-  })
-
   it('handles racing signups for same handle', async () => {
     const COUNT = 10
 
-    const invite1 = await createInviteCode(agent, COUNT)
-    const invite2 = await createInviteCode(agent, COUNT)
-
     let successes = 0
     let failures = 0
     const promises: Promise<unknown>[] = []
     for (let i = 0; i < COUNT; i++) {
       const attempt = async () => {
         try {
-          // Use two invites to ensure per-invite locking doesn't
-          // give the appearance of fixing a race for handle.
-          const invite = i % 2 ? invite1 : invite2
           await agent.api.com.atproto.server.createAccount({
             email: `matching@test.com`,
             handle: `matching.test`,
             password: `password`,
-            inviteCode: invite,
           })
           successes++
         } catch (err) {
@@ -381,6 +381,7 @@ describe('account', () => {
   })
 
   it('can perform authenticated requests', async () => {
+    // @TODO each test should be able to run independently & concurrently
     agent.api.setHeader('authorization', `Bearer ${jwt}`)
     const res = await agent.api.com.atproto.server.getSession({})
     expect(res.data.did).toBe(did)
@@ -402,7 +403,7 @@ describe('account', () => {
     )
 
     expect(mail.to).toEqual(email)
-    expect(mail.html).toContain('Reset your password')
+    expect(mail.html).toContain('Reset password')
     expect(mail.html).toContain('alice.test')
 
     const token = getTokenFromMail(mail)
@@ -473,7 +474,7 @@ describe('account', () => {
     )
 
     expect(mail.to).toEqual(email)
-    expect(mail.html).toContain('Reset your password')
+    expect(mail.html).toContain('Reset password')
     expect(mail.html).toContain('alice.test')
 
     const token = getTokenFromMail(mail)
@@ -502,24 +503,23 @@ describe('account', () => {
   it('allows only unexpired password reset tokens', async () => {
     await agent.api.com.atproto.server.requestPasswordReset({ email })
 
-    const user = await db.db
-      .updateTable('user_account')
-      .where('email', '=', email)
+    const res = await ctx.accountManager.db.db
+      .updateTable('email_token')
+      .where('purpose', '=', 'reset_password')
+      .where('did', '=', did)
       .set({
-        passwordResetGrantedAt: new Date(
-          Date.now() - 16 * minsToMs,
-        ).toISOString(),
+        requestedAt: new Date(Date.now() - 16 * minsToMs).toISOString(),
       })
-      .returning(['passwordResetToken'])
+      .returning(['token'])
       .executeTakeFirst()
-    if (!user?.passwordResetToken) {
+    if (!res?.token) {
       throw new Error('Missing reset token')
     }
 
     // Use of expired token fails
     await expect(
       agent.api.com.atproto.server.resetPassword({
-        token: user.passwordResetToken,
+        token: res.token,
         password: passwordAlt,
       }),
     ).rejects.toThrow(ComAtprotoServerResetPassword.ExpiredTokenError)
@@ -540,130 +540,34 @@ describe('account', () => {
     ).resolves.toBeDefined()
   })
 
-  it('allow users to get available user invites', async () => {
-    // first pretend account was made 2 days in the past
-    const twoDaysAgo = new Date(Date.now() - 2 * DAY).toISOString()
-    await ctx.db.db
-      .updateTable('user_account')
-      .set({ createdAt: twoDaysAgo })
-      .where('did', '=', did)
-      .execute()
-    const res1 = await agent.api.com.atproto.server.getAccountInviteCodes()
-    expect(res1.data.codes.length).toBe(2)
-
-    // use both invites and confirm we can't get any more
-    await ctx.db.db
-      .insertInto('invite_code_use')
-      .values(
-        res1.data.codes.map((code) => ({
-          code: code.code,
-          usedBy: 'did:example:test',
-          usedAt: new Date().toISOString(),
-        })),
-      )
-      .execute()
-    const res2 = await agent.api.com.atproto.server.getAccountInviteCodes()
-    expect(res2.data.codes.length).toBe(2)
-
-    // now pretend it was made 10 days ago
-    const tenDaysAgo = new Date(Date.now() - 10 * DAY).toISOString()
-    await ctx.db.db
-      .updateTable('user_account')
-      .set({ createdAt: tenDaysAgo })
-      .where('did', '=', did)
-      .execute()
-
-    const res3 = await agent.api.com.atproto.server.getAccountInviteCodes({
-      includeUsed: false,
-      createAvailable: false,
+  it('allows an admin to update password', async () => {
+    const tryUnauthed = agent.api.com.atproto.admin.updateAccountPassword({
+      did,
+      password: 'new-admin-pass',
     })
-    expect(res3.data.codes.length).toBe(0)
-    const res4 = await agent.api.com.atproto.server.getAccountInviteCodes()
-    expect(res4.data.codes.length).toBe(7)
-    const res5 = await agent.api.com.atproto.server.getAccountInviteCodes({
-      includeUsed: false,
-    })
-    expect(res5.data.codes.length).toBe(5)
-  })
+    await expect(tryUnauthed).rejects.toThrow('Authentication Required')
 
-  it('prevents use of disabled codes', async () => {
-    const first = await createInviteCode(agent, 1)
-    const accntCodes =
-      await agent.api.com.atproto.server.getAccountInviteCodes()
-    const second = accntCodes.data.codes[0].code
-
-    // disabled first by code & second by did
-    await agent.api.com.atproto.admin.disableInviteCodes(
+    await agent.api.com.atproto.admin.updateAccountPassword(
+      { did, password: 'new-admin-password' },
       {
-        codes: [first],
-        accounts: [did],
-      },
-      {
-        headers: { authorization: util.adminAuth() },
+        headers: network.pds.adminAuthHeaders(),
         encoding: 'application/json',
       },
     )
 
-    const attempt = async (code: string) => {
-      await agent.api.com.atproto.server.createAccount({
-        email: 'disable@test.com',
-        handle: 'disable.test',
-        inviteCode: code,
-        password: 'disabled',
-      })
-    }
+    // old password fails
+    await expect(
+      agent.api.com.atproto.server.createSession({
+        identifier: did,
+        password,
+      }),
+    ).rejects.toThrow('Invalid identifier or password')
 
-    await expect(attempt(first)).rejects.toThrow(
-      ComAtprotoServerCreateAccount.InvalidInviteCodeError,
-    )
-    await expect(attempt(second)).rejects.toThrow(
-      ComAtprotoServerCreateAccount.InvalidInviteCodeError,
-    )
-  })
-
-  it('does not allow disabling all admin codes', async () => {
-    const attempt = agent.api.com.atproto.admin.disableInviteCodes(
-      {
-        accounts: ['admin'],
-      },
-      {
-        headers: { authorization: util.adminAuth() },
-        encoding: 'application/json',
-      },
-    )
-    await expect(attempt).rejects.toThrow('cannot disable admin invite codes')
-  })
-
-  it('creates many invite codes', async () => {
-    const accounts = ['did:example:one', 'did:example:two', 'did:example:three']
-    const res = await agent.api.com.atproto.server.createInviteCodes(
-      {
-        useCount: 2,
-        codeCount: 2,
-        forAccounts: accounts,
-      },
-      {
-        headers: { authorization: util.adminAuth() },
-        encoding: 'application/json',
-      },
-    )
-    expect(res.data.codes.length).toBe(3)
-    const fromDb = await ctx.db.db
-      .selectFrom('invite_code')
-      .selectAll()
-      .where('forUser', 'in', accounts)
-      .execute()
-    expect(fromDb.length).toBe(6)
-    const dbCodesByUser = {}
-    for (const row of fromDb) {
-      expect(row.disabled).toBe(0)
-      expect(row.availableUses).toBe(2)
-      dbCodesByUser[row.forUser] ??= []
-      dbCodesByUser[row.forUser].push(row.code)
-    }
-    for (const { account, codes } of res.data.codes) {
-      expect(codes.length).toBe(2)
-      expect(codes.sort()).toEqual(dbCodesByUser[account].sort())
-    }
+    await expect(
+      agent.api.com.atproto.server.createSession({
+        identifier: did,
+        password: 'new-admin-password',
+      }),
+    ).resolves.toBeDefined()
   })
 })

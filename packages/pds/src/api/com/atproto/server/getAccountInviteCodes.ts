@@ -1,88 +1,75 @@
-import { Server } from '../../../../lexicon'
-import AppContext from '../../../../context'
-import { genInvCodes } from './util'
+import assert from 'node:assert'
+
 import { InvalidRequestError } from '@atproto/xrpc-server'
+
+import { CodeDetail } from '../../../../account-manager/helpers/invite'
+import AppContext from '../../../../context'
+import { Server } from '../../../../lexicon'
+import { resultPassthru } from '../../../proxy'
+import { genInvCodes } from './util'
+import { ids } from '../../../../lexicon/lexicons'
 
 export default function (server: Server, ctx: AppContext) {
   server.com.atproto.server.getAccountInviteCodes({
-    auth: ctx.accessVerifierCheckTakedown,
+    auth: ctx.authVerifier.accessFull({ checkTakedown: true }),
     handler: async ({ params, auth }) => {
+      if (ctx.entrywayAgent) {
+        assert(ctx.cfg.entryway)
+        return resultPassthru(
+          await ctx.entrywayAgent.com.atproto.server.getAccountInviteCodes(
+            params,
+            await ctx.serviceAuthHeaders(
+              auth.credentials.did,
+              ctx.cfg.entryway.did,
+              ids.ComAtprotoServerGetAccountInviteCodes,
+            ),
+          ),
+        )
+      }
+
       const requester = auth.credentials.did
       const { includeUsed, createAvailable } = params
 
-      const accntSrvc = ctx.services.account(ctx.db)
-
-      const [user, userCodes] = await Promise.all([
-        ctx.db.db
-          .selectFrom('user_account')
-          .where('did', '=', requester)
-          .select(['invitesDisabled', 'createdAt'])
-          .executeTakeFirstOrThrow(),
-        accntSrvc.getAccountInviteCodes(requester),
+      const [account, userCodes] = await Promise.all([
+        ctx.accountManager.getAccount(requester),
+        ctx.accountManager.getAccountInvitesCodes(requester),
       ])
-      const unusedCodes = userCodes.filter(
-        (row) => !row.disabled && row.available > row.uses.length,
-      )
+      if (!account) {
+        throw new InvalidRequestError('Account not found', 'NotFound')
+      }
 
-      let created: string[] = []
+      let created: CodeDetail[] = []
 
-      // if the user wishes to create available codes & the server allows that,
-      // we determine the number to create by dividing their account lifetime by the interval at which they can create codes
-      // we allow a max of 5 open codes at a given time
-      // note: even if a user is disabled from future invites, we still create the invites for bookkeeping, we just immediately disable them as well
-      const now = new Date().toISOString()
-      if (createAvailable && ctx.cfg.userInviteInterval !== null) {
-        const accountLifespan = Date.now() - new Date(user.createdAt).getTime()
-        const couldCreate = Math.floor(
-          accountLifespan / ctx.cfg.userInviteInterval,
-        )
-        const toCreate = Math.min(
-          5 - unusedCodes.length,
-          couldCreate - userCodes.length,
-        )
+      if (
+        createAvailable &&
+        ctx.cfg.invites.required &&
+        ctx.cfg.invites.interval !== null
+      ) {
+        const { toCreate, total } = calculateCodesToCreate({
+          did: requester,
+          userCreatedAt: new Date(account.createdAt).getTime(),
+          codes: userCodes,
+          epoch: ctx.cfg.invites.epoch,
+          interval: ctx.cfg.invites.interval,
+        })
         if (toCreate > 0) {
-          created = genInvCodes(ctx.cfg, toCreate)
-          const rows = created.map((code) => ({
-            code: code,
-            availableUses: 1,
-            disabled: user.invitesDisabled,
-            forUser: requester,
-            createdBy: requester,
-            createdAt: now,
-          }))
-          await ctx.db.transaction(async (dbTxn) => {
-            await dbTxn.db.insertInto('invite_code').values(rows).execute()
-            const forUser = await dbTxn.db
-              .selectFrom('invite_code')
-              .where('forUser', '=', requester)
-              .selectAll()
-              .execute()
-            if (forUser.length > userCodes.length + toCreate) {
-              throw new InvalidRequestError(
-                'attempted to create additional codes in another request',
-                'DuplicateCreate',
-              )
-            }
-          })
+          const codes = genInvCodes(ctx.cfg, toCreate)
+          created = await ctx.accountManager.createAccountInviteCodes(
+            requester,
+            codes,
+            total,
+            account.invitesDisabled ?? 0,
+          )
         }
       }
 
-      const preexisting = includeUsed ? userCodes : unusedCodes
+      const allCodes = [...userCodes, ...created]
 
-      const allCodes = [
-        ...preexisting,
-        ...created.map((code) => ({
-          code: code,
-          available: 1,
-          disabled: user.invitesDisabled === 1 ? true : false,
-          forAccount: requester,
-          createdBy: requester,
-          createdAt: now,
-          uses: [],
-        })),
-      ]
-
-      const filtered = allCodes.filter((code) => !code.disabled)
+      const filtered = allCodes.filter((code) => {
+        if (code.disabled) return false
+        if (!includeUsed && code.uses.length >= code.available) return false
+        return true
+      })
 
       return {
         encoding: 'application/json',
@@ -92,4 +79,60 @@ export default function (server: Server, ctx: AppContext) {
       }
     },
   })
+}
+
+/**
+ * WARNING: TRICKY SUBTLE MATH - DONT MESS WITH THIS FUNCTION UNLESS YOUR'RE VERY CONFIDENT
+ * if the user wishes to create available codes & the server allows that,
+ * we determine the number to create by dividing their account lifetime by the interval at which they can create codes
+ * if an invite epoch is provided, we only calculate available invites since that epoch
+ * we allow a max of 5 open codes at a given time
+ * note: even if a user is disabled from future invites, we still create the invites for bookkeeping, we just immediately disable them as well
+ */
+const calculateCodesToCreate = (opts: {
+  did: string
+  userCreatedAt: number
+  codes: CodeDetail[]
+  epoch: number
+  interval: number
+}): { toCreate: number; total: number } => {
+  // for the sake of generating routine interval codes, we do not count explicitly gifted admin codes
+  const routineCodes = opts.codes.filter((code) => code.createdBy !== 'admin')
+  const unusedRoutineCodes = routineCodes.filter(
+    (row) => !row.disabled && row.available > row.uses.length,
+  )
+
+  const userLifespan = Date.now() - opts.userCreatedAt
+
+  // how many codes a user could create within the current epoch if they have 0
+  let couldCreate: number
+
+  if (opts.userCreatedAt >= opts.epoch) {
+    // if the user was created after the epoch, then they can create a code for each interval since the epoch
+    couldCreate = Math.floor(userLifespan / opts.interval)
+  } else {
+    // if the user was created before the epoch, we:
+    // - calculate the total intervals since account creation
+    // - calculate the total intervals before the epoch
+    // - subtract the two
+    const couldCreateTotal = Math.floor(userLifespan / opts.interval)
+    const userPreEpochLifespan = opts.epoch - opts.userCreatedAt
+    const couldCreateBeforeEpoch = Math.floor(
+      userPreEpochLifespan / opts.interval,
+    )
+    couldCreate = couldCreateTotal - couldCreateBeforeEpoch
+  }
+  // we count the codes that the user has created within the current epoch
+  const epochCodes = routineCodes.filter(
+    (code) => new Date(code.createdAt).getTime() > opts.epoch,
+  )
+  // finally we the number of codes they currently have from the number that they could create, and take a max of 5
+  const toCreate = Math.min(
+    5 - unusedRoutineCodes.length,
+    couldCreate - epochCodes.length,
+  )
+  return {
+    toCreate,
+    total: routineCodes.length + toCreate,
+  }
 }

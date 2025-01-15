@@ -1,13 +1,14 @@
 import { CID } from 'multiformats/cid'
+import { dataToCborBlock, TID } from '@atproto/common'
 import * as crypto from '@atproto/crypto'
+import { lexToIpld } from '@atproto/lexicon'
 import {
   Commit,
+  CommitData,
   def,
   RecordCreateOp,
   RecordWriteOp,
-  CommitData,
   WriteOpAction,
-  RebaseData,
 } from './types'
 import { RepoStorage } from './storage'
 import { MST } from './mst'
@@ -16,6 +17,7 @@ import log from './logger'
 import BlockMap from './block-map'
 import { ReadableRepo } from './readable-repo'
 import * as util from './util'
+import CidSet from './cid-set'
 
 type Params = {
   storage: RepoStorage
@@ -46,25 +48,30 @@ export class Repo extends ReadableRepo {
       const dataKey = util.formatDataKey(record.collection, record.rkey)
       data = await data.add(dataKey, cid)
     }
+    const dataCid = await data.getPointer()
+    const diff = await DataDiff.of(data, null)
+    newBlocks.addMap(diff.newMstBlocks)
 
-    const unstoredData = await data.getUnstoredBlocks()
-    newBlocks.addMap(unstoredData.blocks)
-
+    const rev = TID.nextStr()
     const commit = await util.signCommit(
       {
         did,
-        version: 2,
-        prev: null,
-        data: unstoredData.root,
+        version: 3,
+        rev,
+        prev: null, // added for backwards compatibility with v2
+        data: dataCid,
       },
       keypair,
     )
     const commitCid = await newBlocks.add(commit)
-
     return {
-      commit: commitCid,
+      cid: commitCid,
+      rev,
+      since: null,
       prev: null,
-      blocks: newBlocks,
+      newBlocks,
+      relevantBlocks: newBlocks,
+      removedCids: diff.removedCids,
     }
   }
 
@@ -73,7 +80,7 @@ export class Repo extends ReadableRepo {
     commit: CommitData,
   ): Promise<Repo> {
     await storage.applyCommit(commit)
-    return Repo.load(storage, commit.commit)
+    return Repo.load(storage, commit.cid)
   }
 
   static async create(
@@ -92,17 +99,17 @@ export class Repo extends ReadableRepo {
   }
 
   static async load(storage: RepoStorage, cid?: CID) {
-    const commitCid = cid || (await storage.getHead())
+    const commitCid = cid || (await storage.getRoot())
     if (!commitCid) {
       throw new Error('No cid provided and none in storage')
     }
-    const commit = await storage.readObj(commitCid, def.commit)
+    const commit = await storage.readObj(commitCid, def.versionedCommit)
     const data = await MST.load(storage, commit.data)
     log.info({ did: commit.did }, 'loaded repo for')
     return new Repo({
       storage,
       data,
-      commit,
+      commit: util.ensureV3Commit(commit),
       cid: commitCid,
     })
   }
@@ -112,16 +119,16 @@ export class Repo extends ReadableRepo {
     keypair: crypto.Keypair,
   ): Promise<CommitData> {
     const writes = Array.isArray(toWrite) ? toWrite : [toWrite]
-    const commitBlocks = new BlockMap()
+    const leaves = new BlockMap()
 
     let data = this.data
     for (const write of writes) {
       if (write.action === WriteOpAction.Create) {
-        const cid = await commitBlocks.add(write.record)
+        const cid = await leaves.add(write.record)
         const dataKey = write.collection + '/' + write.rkey
         data = await data.add(dataKey, cid)
       } else if (write.action === WriteOpAction.Update) {
-        const cid = await commitBlocks.add(write.record)
+        const cid = await leaves.add(write.record)
         const dataKey = write.collection + '/' + write.rkey
         data = await data.update(dataKey, cid)
       } else if (write.action === WriteOpAction.Delete) {
@@ -130,44 +137,60 @@ export class Repo extends ReadableRepo {
       }
     }
 
-    const unstoredData = await data.getUnstoredBlocks()
-    commitBlocks.addMap(unstoredData.blocks)
-
-    // ensure we're not missing any blocks that were removed and then readded in this commit
+    const dataCid = await data.getPointer()
     const diff = await DataDiff.of(data, this.data)
-    const found = commitBlocks.getMany(diff.newCidList())
-    if (found.missing.length > 0) {
-      const fromStorage = await this.storage.getBlocks(found.missing)
-      if (fromStorage.missing.length > 0) {
-        // this shouldn't ever happen
-        throw new Error(
-          'Could not find block for commit in Datastore or storage',
-        )
-      }
-      commitBlocks.addMap(fromStorage.blocks)
-    }
+    const newBlocks = diff.newMstBlocks
+    const removedCids = diff.removedCids
 
+    const relevantBlocks = new BlockMap()
+    await Promise.all(
+      writes.map((op) =>
+        data.addBlocksForPath(
+          util.formatDataKey(op.collection, op.rkey),
+          relevantBlocks,
+        ),
+      ),
+    )
+
+    const addedLeaves = leaves.getMany(diff.newLeafCids.toList())
+    if (addedLeaves.missing.length > 0) {
+      throw new Error(`Missing leaf blocks: ${addedLeaves.missing}`)
+    }
+    newBlocks.addMap(addedLeaves.blocks)
+    relevantBlocks.addMap(addedLeaves.blocks)
+
+    const rev = TID.nextStr(this.commit.rev)
     const commit = await util.signCommit(
       {
         did: this.did,
-        version: 2,
-        prev: this.cid,
-        data: unstoredData.root,
+        version: 3,
+        rev,
+        prev: null, // added for backwards compatibility with v2
+        data: dataCid,
       },
       keypair,
     )
-    const commitCid = await commitBlocks.add(commit)
+    const commitBlock = await dataToCborBlock(lexToIpld(commit))
+    if (!commitBlock.cid.equals(this.cid)) {
+      newBlocks.set(commitBlock.cid, commitBlock.bytes)
+      relevantBlocks.set(commitBlock.cid, commitBlock.bytes)
+      removedCids.add(this.cid)
+    }
 
     return {
-      commit: commitCid,
+      cid: commitBlock.cid,
+      rev,
+      since: this.commit.rev,
       prev: this.cid,
-      blocks: commitBlocks,
+      newBlocks,
+      relevantBlocks,
+      removedCids,
     }
   }
 
   async applyCommit(commitData: CommitData): Promise<Repo> {
     await this.storage.applyCommit(commitData)
-    return Repo.load(this.storage, commitData.commit)
+    return Repo.load(this.storage, commitData.cid)
   }
 
   async applyWrites(
@@ -178,35 +201,33 @@ export class Repo extends ReadableRepo {
     return this.applyCommit(commit)
   }
 
-  async formatRebase(keypair: crypto.Keypair): Promise<RebaseData> {
-    const preservedCids = await this.data.allCids()
-    const blocks = new BlockMap()
+  async formatResignCommit(rev: string, keypair: crypto.Keypair) {
     const commit = await util.signCommit(
       {
         did: this.did,
-        version: 2,
-        prev: null,
+        version: 3,
+        rev,
+        prev: null, // added for backwards compatibility with v2
         data: this.commit.data,
       },
       keypair,
     )
-    const commitCid = await blocks.add(commit)
+    const newBlocks = new BlockMap()
+    const commitCid = await newBlocks.add(commit)
     return {
-      commit: commitCid,
-      rebased: this.cid,
-      blocks,
-      preservedCids: preservedCids.toList(),
+      cid: commitCid,
+      rev,
+      since: null,
+      prev: null,
+      newBlocks,
+      relevantBlocks: newBlocks,
+      removedCids: new CidSet([this.cid]),
     }
   }
 
-  async applyRebase(rebase: RebaseData): Promise<Repo> {
-    await this.storage.applyRebase(rebase)
-    return Repo.load(this.storage, rebase.commit)
-  }
-
-  async rebase(keypair: crypto.Keypair): Promise<Repo> {
-    const rebaseData = await this.formatRebase(keypair)
-    return this.applyRebase(rebaseData)
+  async resignCommit(rev: string, keypair: crypto.Keypair) {
+    const formatted = await this.formatResignCommit(rev, keypair)
+    return this.applyCommit(formatted)
   }
 }
 

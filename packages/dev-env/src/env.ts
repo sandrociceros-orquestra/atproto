@@ -1,22 +1,9 @@
+// NOTE: this file should be imported first, particularly before `@atproto/common` (for logging), to ensure that environment variables are respected in library code
 import dotenv from 'dotenv'
-import { StartParams, ServerType, ServerConfig } from './types.js'
 
-const getPorts = (type: ServerType, name: string): ServerConfig[] => {
-  const portsStr = process.env[name]
-  if (!portsStr) return []
-  return portsStr
-    .split(',')
-    .map((str) => parseInt(str))
-    .filter(Boolean)
-    .map((port) => ({ type, port }))
-}
-
-export function load(): StartParams {
+const env = process.env.ENV
+if (env) {
+  dotenv.config({ path: `./.${env}.env` })
+} else {
   dotenv.config()
-
-  return {
-    servers: [
-      ...getPorts(ServerType.PersonalDataServer, 'PERSONAL_DATA_SERVERS'),
-    ],
-  }
 }

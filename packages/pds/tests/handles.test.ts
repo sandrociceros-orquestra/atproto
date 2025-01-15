@@ -1,10 +1,8 @@
-import AtpAgent from '@atproto/api'
-import { DidResolver } from '@atproto/did-resolver'
-import { SeedClient } from './seeds/client'
+import { TestNetworkNoAppView, SeedClient } from '@atproto/dev-env'
+import { AtpAgent } from '@atproto/api'
+import { IdResolver } from '@atproto/identity'
 import basicSeed from './seeds/basic'
-import * as util from './_util'
 import { AppContext } from '../src'
-import { moderatorAuth } from './_util'
 
 // outside of suite so they can be used in mock
 let alice: string
@@ -25,31 +23,36 @@ jest.mock('dns/promises', () => {
 })
 
 describe('handles', () => {
+  let network: TestNetworkNoAppView
   let agent: AtpAgent
-  let close: util.CloseFn
   let sc: SeedClient
   let ctx: AppContext
-  let didResolver: DidResolver
+  let idResolver: IdResolver
 
   const newHandle = 'alice2.test'
 
   beforeAll(async () => {
-    const server = await util.runTestServer({
+    network = await TestNetworkNoAppView.create({
       dbPostgresSchema: 'handles',
     })
-    ctx = server.ctx
-    didResolver = new DidResolver({ plcUrl: ctx.cfg.didPlcUrl })
-    close = server.close
-    agent = new AtpAgent({ service: server.url })
-    sc = new SeedClient(agent)
+    // @ts-expect-error Error due to circular dependency with the dev-env package
+    ctx = network.pds.ctx
+    idResolver = new IdResolver({ plcUrl: ctx.cfg.identity.plcUrl })
+    agent = network.pds.getClient()
+    sc = network.getSeedClient()
     await basicSeed(sc)
     alice = sc.dids.alice
     bob = sc.dids.bob
   })
 
   afterAll(async () => {
-    await close()
+    await network.close()
   })
+
+  const getHandleFromDb = async (did: string): Promise<string | undefined> => {
+    const res = await ctx.accountManager.getAccount(did)
+    return res?.handle ?? undefined
+  }
 
   it('resolves handles', async () => {
     const res = await agent.api.com.atproto.identity.resolveHandle({
@@ -63,11 +66,6 @@ describe('handles', () => {
       handle: 'aLicE.tEst',
     })
     expect(res.data.did).toBe(alice)
-  })
-
-  it('does not resolve a "handle" for the service', async () => {
-    const promise = agent.api.com.atproto.identity.resolveHandle()
-    await expect(promise).rejects.toThrow('Unable to resolve handle')
   })
 
   it('allows a user to change their handle', async () => {
@@ -86,7 +84,7 @@ describe('handles', () => {
   })
 
   it('updates their did document', async () => {
-    const data = await didResolver.resolveAtprotoData(alice)
+    const data = await idResolver.did.resolveAtprotoData(alice)
     expect(data.handle).toBe(newHandle)
   })
 
@@ -99,35 +97,6 @@ describe('handles', () => {
     sc.accounts[alice].refreshJwt = res.data.refreshJwt
   })
 
-  it('returns the correct handle in views', async () => {
-    const profile = await agent.api.app.bsky.actor.getProfile(
-      { actor: alice },
-      { headers: sc.getHeaders(bob) },
-    )
-    expect(profile.data.handle).toBe(newHandle)
-
-    const timeline = await agent.api.app.bsky.feed.getTimeline(
-      {},
-      { headers: sc.getHeaders(bob) },
-    )
-
-    const alicePosts = timeline.data.feed.filter(
-      (post) => post.post.author.did === alice,
-    )
-    for (const post of alicePosts) {
-      expect(post.post.author.handle).toBe(newHandle)
-    }
-
-    const followers = await agent.api.app.bsky.graph.getFollowers(
-      { actor: bob },
-      { headers: sc.getHeaders(bob) },
-    )
-
-    const aliceFollows = followers.data.followers.filter((f) => f.did === alice)
-    expect(aliceFollows.length).toBe(1)
-    expect(aliceFollows[0].handle).toBe(newHandle)
-  })
-
   it('does not allow taking a handle that already exists', async () => {
     const attempt = agent.api.com.atproto.identity.updateHandle(
       { handle: 'Bob.test' },
@@ -136,8 +105,15 @@ describe('handles', () => {
     await expect(attempt).rejects.toThrow('Handle already taken: bob.test')
   })
 
+  it('handle updates are idempotent', async () => {
+    await agent.api.com.atproto.identity.updateHandle(
+      { handle: 'Bob.test' },
+      { headers: sc.getHeaders(bob), encoding: 'application/json' },
+    )
+  })
+
   it('if handle update fails, it does not update their did document', async () => {
-    const data = await didResolver.resolveAtprotoData(alice)
+    const data = await idResolver.did.resolveAtprotoData(alice)
     expect(data.handle).toBe(newHandle)
   })
 
@@ -193,13 +169,10 @@ describe('handles', () => {
       },
       { headers: sc.getHeaders(alice), encoding: 'application/json' },
     )
-    const profile = await agent.api.app.bsky.actor.getProfile(
-      { actor: alice },
-      { headers: sc.getHeaders(bob) },
-    )
-    expect(profile.data.handle).toBe('alice.external')
+    const dbHandle = await getHandleFromDb(alice)
+    expect(dbHandle).toBe('alice.external')
 
-    const data = await didResolver.resolveAtprotoData(alice)
+    const data = await idResolver.did.resolveAtprotoData(alice)
     expect(data.handle).toBe('alice.external')
   })
 
@@ -224,11 +197,8 @@ describe('handles', () => {
       'External handle did not resolve to DID',
     )
 
-    const profile = await agent.api.app.bsky.actor.getProfile(
-      { actor: alice },
-      { headers: sc.getHeaders(bob) },
-    )
-    expect(profile.data.handle).toBe('alice.external')
+    const dbHandle = await getHandleFromDb(alice)
+    expect(dbHandle).toBe('alice.external')
   })
 
   it('allows admin overrules of service domains', async () => {
@@ -238,16 +208,13 @@ describe('handles', () => {
         handle: 'bob-alt.test',
       },
       {
-        headers: { authorization: util.adminAuth() },
+        headers: network.pds.adminAuthHeaders(),
         encoding: 'application/json',
       },
     )
 
-    const profile = await agent.api.app.bsky.actor.getProfile(
-      { actor: bob },
-      { headers: sc.getHeaders(bob) },
-    )
-    expect(profile.data.handle).toBe('bob-alt.test')
+    const dbHandle = await getHandleFromDb(bob)
+    expect(dbHandle).toBe('bob-alt.test')
   })
 
   it('allows admin override of reserved domains', async () => {
@@ -257,46 +224,13 @@ describe('handles', () => {
         handle: 'dril.test',
       },
       {
-        headers: { authorization: util.adminAuth() },
+        headers: network.pds.adminAuthHeaders(),
         encoding: 'application/json',
       },
     )
 
-    const profile = await agent.api.app.bsky.actor.getProfile(
-      { actor: bob },
-      { headers: sc.getHeaders(bob) },
-    )
-    expect(profile.data.handle).toBe('dril.test')
-  })
-
-  it('disallows admin overrules of off-service domains', async () => {
-    const attempt = agent.api.com.atproto.admin.updateAccountHandle(
-      {
-        did: alice,
-        handle: 'alice-alt.test',
-      },
-      {
-        headers: { authorization: util.adminAuth() },
-        encoding: 'application/json',
-      },
-    )
-    await expect(attempt).rejects.toThrow(
-      'Account not on an available service domain: alice.external',
-    )
-  })
-
-  it('disallows setting handle to an off-service domain', async () => {
-    const attempt = agent.api.com.atproto.admin.updateAccountHandle(
-      {
-        did: bob,
-        handle: 'bob.external',
-      },
-      {
-        headers: { authorization: util.adminAuth() },
-        encoding: 'application/json',
-      },
-    )
-    await expect(attempt).rejects.toThrow('Unsupported domain')
+    const dbHandle = await getHandleFromDb(bob)
+    expect(dbHandle).toBe('dril.test')
   })
 
   it('requires admin auth', async () => {
@@ -316,16 +250,5 @@ describe('handles', () => {
       handle: 'bob-alt.test',
     })
     await expect(attempt2).rejects.toThrow('Authentication Required')
-    const attempt3 = agent.api.com.atproto.admin.updateAccountHandle(
-      {
-        did: bob,
-        handle: 'bob-alt.test',
-      },
-      {
-        headers: { authorization: moderatorAuth() },
-        encoding: 'application/json',
-      },
-    )
-    await expect(attempt3).rejects.toThrow('Authentication Required')
   })
 })

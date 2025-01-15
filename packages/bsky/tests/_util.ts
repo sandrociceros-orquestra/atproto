@@ -1,31 +1,35 @@
-import { wait } from '@atproto/common'
-import { AtUri } from '@atproto/uri'
+import { AppBskyFeedGetPostThread } from '@atproto/api'
 import { lexToJson } from '@atproto/lexicon'
-import { TestEnvInfo } from '@atproto/dev-env'
+import { AtUri } from '@atproto/syntax'
+import { type Express } from 'express'
 import { CID } from 'multiformats/cid'
-import * as uint8arrays from 'uint8arrays'
+import { Server } from 'node:http'
+
+import { AddressInfo } from 'node:net'
+import { isViewRecord } from '../src/lexicon/types/app/bsky/embed/record'
 import {
   FeedViewPost,
   PostView,
+  isPostView,
   isThreadViewPost,
 } from '../src/lexicon/types/app/bsky/feed/defs'
-import { isViewRecord } from '../src/lexicon/types/app/bsky/embed/record'
-import { createServiceJwt } from '@atproto/pds/src/auth'
+import {
+  LabelerView,
+  isLabelerView,
+  isLabelerViewDetailed,
+} from '../src/lexicon/types/app/bsky/labeler/defs'
 
-// for pds
-export const adminAuth = () => {
-  return (
-    'Basic ' +
-    uint8arrays.toString(
-      uint8arrays.fromString('admin:admin-pass', 'utf8'),
-      'base64pad',
-    )
-  )
-}
+type ThreadViewPost = Extract<
+  AppBskyFeedGetPostThread.OutputSchema['thread'],
+  { post: { uri: string } }
+>
 
-export const appViewHeaders = async (did: string, env: TestEnvInfo) => {
-  const jwt = await createServiceJwt(did, env.pds.ctx.repoSigningKey)
-  return { authorization: `Bearer ${jwt}` }
+export function assertIsThreadViewPost(
+  value: unknown,
+): asserts value is ThreadViewPost {
+  expect(value).toMatchObject({
+    $type: 'app.bsky.feed.defs#threadViewPost',
+  })
 }
 
 // Swap out identifiers and dates with stable
@@ -68,19 +72,25 @@ export const forSnapshot = (obj: unknown) => {
         return constantDate
       }
     }
-    if (str.match(/^\d+::bafy/)) {
+    if (str.match(/^\d+__bafy/)) {
       return constantKeysetCursor
     }
-    if (str.match(/\/image\/[^/]+\/.+\/did:plc:[^/]+\/[^/]+@[\w]+$/)) {
+    if (str.match(/\/img\/[^/]+\/.+\/did:plc:[^/]+\/[^/]+@[\w]+$/)) {
       // Match image urls
       const match = str.match(
-        /\/image\/([^/]+)\/.+\/(did:plc:[^/]+)\/([^/]+)@[\w]+$/,
+        /\/img\/[^/]+\/.+\/(did:plc:[^/]+)\/([^/]+)@[\w]+$/,
       )
       if (!match) return str
-      const [, sig, did, cid] = match
+      const [, did, cid] = match
+      return str.replace(did, take(users, did)).replace(cid, take(cids, cid))
+    }
+    if (str.match(/\/vid\/did%3Aplc%3A[^/]+\/[^/]+\/[^/]+$/)) {
+      // Match video urls
+      const match = str.match(/\/vid\/(did%3Aplc%3A[^/]+)\/([^/]+)\/[^/]+$/)
+      if (!match) return str
+      const [, did, cid] = match
       return str
-        .replace(sig, 'sig()')
-        .replace(did, take(users, did))
+        .replace(did, take(users, decodeURIComponent(did)))
         .replace(cid, take(cids, cid))
     }
     let isCid: boolean
@@ -132,7 +142,7 @@ export function take(
 }
 
 export const constantDate = new Date(0).toISOString()
-export const constantKeysetCursor = '0000000000000::bafycid'
+export const constantKeysetCursor = '0000000000000__bafycid'
 
 const mapLeafValues = (obj: unknown, fn: (val: unknown) => unknown) => {
   if (Array.isArray(obj)) {
@@ -162,25 +172,6 @@ export const paginateAll = async <T extends { cursor?: string }>(
   return results
 }
 
-export const processAll = async (server: TestEnvInfo, timeout = 5000) => {
-  const { bsky, pds } = server
-  const sub = bsky.sub
-  if (!sub) return
-  const { db } = pds.ctx.db
-  const start = Date.now()
-  while (Date.now() - start < timeout) {
-    await wait(50)
-    if (!sub) return
-    const state = await sub.getState()
-    const { lastSeq } = await db
-      .selectFrom('repo_seq')
-      .select(db.fn.max('repo_seq.seq').as('lastSeq'))
-      .executeTakeFirstOrThrow()
-    if (state.cursor === lastSeq) return
-  }
-  throw new Error(`Sequence was not processed within ${timeout}ms`)
-}
-
 // @NOTE mutates
 export const stripViewer = <T extends { viewer?: Record<string, unknown> }>(
   val: T,
@@ -190,22 +181,26 @@ export const stripViewer = <T extends { viewer?: Record<string, unknown> }>(
 }
 
 // @NOTE mutates
-export const stripViewerFromPost = (post: PostView): PostView => {
+export const stripViewerFromPost = (postUnknown: unknown): PostView => {
+  if (postUnknown?.['$type'] && !isPostView(postUnknown)) {
+    throw new Error('Expected post view')
+  }
+  const post = postUnknown as PostView
   post.author = stripViewer(post.author)
   const recordEmbed =
     post.embed && isViewRecord(post.embed.record)
       ? post.embed.record // Record from record embed
       : post.embed?.['record'] && isViewRecord(post.embed['record']['record'])
-      ? post.embed['record']['record'] // Record from record-with-media embed
-      : undefined
+        ? post.embed['record']['record'] // Record from record-with-media embed
+        : undefined
   if (recordEmbed) {
     recordEmbed.author = stripViewer(recordEmbed.author)
     recordEmbed.embeds?.forEach((deepEmbed) => {
       const deepRecordEmbed = isViewRecord(deepEmbed.record)
         ? deepEmbed.record // Record from record embed
         : deepEmbed['record'] && isViewRecord(deepEmbed['record']['record'])
-        ? deepEmbed['record']['record'] // Record from record-with-media embed
-        : undefined
+          ? deepEmbed['record']['record'] // Record from record-with-media embed
+          : undefined
       if (deepRecordEmbed) {
         deepRecordEmbed.author = stripViewer(deepRecordEmbed.author)
       }
@@ -217,6 +212,7 @@ export const stripViewerFromPost = (post: PostView): PostView => {
 // @NOTE mutates
 export const stripViewerFromThread = <T>(thread: T): T => {
   if (!isThreadViewPost(thread)) return thread
+  delete thread.viewer
   thread.post = stripViewerFromPost(thread.post)
   if (isThreadViewPost(thread.parent)) {
     thread.parent = stripViewerFromThread(thread.parent)
@@ -225,4 +221,63 @@ export const stripViewerFromThread = <T>(thread: T): T => {
     thread.replies = thread.replies.map(stripViewerFromThread)
   }
   return thread
+}
+
+// @NOTE mutates
+export const stripViewerFromLabeler = (
+  serviceUnknown: unknown,
+): LabelerView => {
+  if (
+    serviceUnknown?.['$type'] &&
+    !isLabelerView(serviceUnknown) &&
+    !isLabelerViewDetailed(serviceUnknown)
+  ) {
+    throw new Error('Expected mod service view')
+  }
+  const labeler = serviceUnknown as LabelerView
+  labeler.creator = stripViewer(labeler.creator)
+  return stripViewer(labeler)
+}
+
+export async function startServer(app: Express) {
+  return new Promise<{
+    origin: string
+    server: Server
+    stop: () => Promise<void>
+  }>((resolve, reject) => {
+    const onListen = () => {
+      const port = (server.address() as AddressInfo).port
+      resolve({
+        server,
+        origin: `http://localhost:${port}`,
+        stop: () => stopServer(server),
+      })
+      cleanup()
+    }
+    const onError = (err: Error) => {
+      reject(err)
+      cleanup()
+    }
+    const cleanup = () => {
+      server.removeListener('listening', onListen)
+      server.removeListener('error', onError)
+    }
+
+    const server = app
+      .listen(0)
+      .once('listening', onListen)
+      .once('error', onError)
+  })
+}
+
+export async function stopServer(server: Server) {
+  return new Promise<void>((resolve, reject) => {
+    server.close((err) => {
+      if (err) {
+        reject(err)
+      } else {
+        resolve()
+      }
+    })
+  })
 }

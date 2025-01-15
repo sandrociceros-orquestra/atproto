@@ -1,5 +1,6 @@
 import { AsyncBuffer, AsyncBufferFullError } from '@atproto/common'
-import Sequencer, { SeqEvt } from '.'
+import { Sequencer, SeqEvt } from '.'
+import { InvalidRequestError } from '@atproto/xrpc-server'
 
 export type OutboxOpts = {
   maxBufferSize: number
@@ -12,7 +13,10 @@ export class Outbox {
   cutoverBuffer: SeqEvt[]
   outBuffer: AsyncBuffer<SeqEvt>
 
-  constructor(public sequencer: Sequencer, opts: Partial<OutboxOpts> = {}) {
+  constructor(
+    public sequencer: Sequencer,
+    opts: Partial<OutboxOpts> = {},
+  ) {
     const { maxBufferSize = 500 } = opts
     this.cutoverBuffer = []
     this.outBuffer = new AsyncBuffer<SeqEvt>(maxBufferSize)
@@ -29,12 +33,11 @@ export class Outbox {
   // immediately yield them
   async *events(
     backfillCursor?: number,
-    backFillTime?: string,
     signal?: AbortSignal,
   ): AsyncGenerator<SeqEvt> {
     // catch up as much as we can
     if (backfillCursor !== undefined) {
-      for await (const evt of this.getBackfill(backfillCursor, backFillTime)) {
+      for await (const evt of this.getBackfill(backfillCursor)) {
         if (signal?.aborted) return
         this.lastSeen = evt.seq
         yield evt
@@ -66,7 +69,6 @@ export class Outbox {
       if (backfillCursor !== undefined) {
         const cutoverEvts = await this.sequencer.requestSeqRange({
           earliestSeq: this.lastSeen > -1 ? this.lastSeen : backfillCursor,
-          earliestTime: backFillTime,
         })
         this.outBuffer.pushMany(cutoverEvts)
         // dont worry about dupes, we ensure order on yield
@@ -90,7 +92,10 @@ export class Outbox {
         }
       } catch (err) {
         if (err instanceof AsyncBufferFullError) {
-          throw new StreamConsumerTooSlowError(err)
+          throw new InvalidRequestError(
+            'Stream consumer too slow',
+            'ConsumerTooSlow',
+          )
         } else {
           throw err
         }
@@ -99,27 +104,21 @@ export class Outbox {
   }
 
   // yields only historical events
-  async *getBackfill(backfillCursor: number, backfillTime?: string) {
+  async *getBackfill(backfillCursor: number) {
+    const PAGE_SIZE = 500
     while (true) {
       const evts = await this.sequencer.requestSeqRange({
-        earliestTime: backfillTime,
         earliestSeq: this.lastSeen > -1 ? this.lastSeen : backfillCursor,
-        limit: 10,
+        limit: PAGE_SIZE,
       })
       for (const evt of evts) {
         yield evt
       }
-      // if we're within 50 of the sequencer, we call it good & switch to cutover
+      // if we're within half a pagesize of the sequencer, we call it good & switch to cutover
       const seqCursor = this.sequencer.lastSeen ?? -1
-      if (seqCursor - this.lastSeen < 10) break
+      if (seqCursor - this.lastSeen < PAGE_SIZE / 2) break
       if (evts.length < 1) break
     }
-  }
-}
-
-export class StreamConsumerTooSlowError extends Error {
-  constructor(bufferErr: AsyncBufferFullError) {
-    super(`Stream consumer too slow: ${bufferErr.message}`)
   }
 }
 

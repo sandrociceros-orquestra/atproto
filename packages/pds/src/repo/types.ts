@@ -1,7 +1,9 @@
 import { CID } from 'multiformats/cid'
-import { AtUri } from '@atproto/uri'
+import { AtUri } from '@atproto/syntax'
 import { WriteOpAction } from '@atproto/repo'
 import { RepoRecord } from '@atproto/lexicon'
+
+export type ValidationStatus = 'valid' | 'unknown' | undefined
 
 export type BlobConstraint = {
   accept?: string[]
@@ -21,6 +23,7 @@ export type PreparedCreate = {
   swapCid?: CID | null
   record: RepoRecord
   blobs: PreparedBlobRef[]
+  validationStatus: ValidationStatus
 }
 
 export type PreparedUpdate = {
@@ -30,6 +33,7 @@ export type PreparedUpdate = {
   swapCid?: CID | null
   record: RepoRecord
   blobs: PreparedBlobRef[]
+  validationStatus: ValidationStatus
 }
 
 export type PreparedDelete = {

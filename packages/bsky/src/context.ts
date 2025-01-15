@@ -1,64 +1,115 @@
+import express from 'express'
 import * as plc from '@did-plc/lib'
-import { DidResolver } from '@atproto/did-resolver'
-import { Database } from './db'
+import { IdResolver } from '@atproto/identity'
+import { AtpAgent } from '@atproto/api'
+import { Keypair } from '@atproto/crypto'
 import { ServerConfig } from './config'
-import { ImageUriBuilder } from './image/uri'
-import { Services } from './services'
-import * as auth from './auth'
-import DidSqlCache from './did-cache'
-import { Labeler } from './labeler'
+import { DataPlaneClient } from './data-plane/client'
+import { Hydrator } from './hydration/hydrator'
+import { Views } from './views'
+import { AuthVerifier } from './auth-verifier'
+import { BsyncClient } from './bsync'
+import { CourierClient } from './courier'
+import { FeatureGates } from './feature-gates'
+import {
+  ParsedLabelers,
+  defaultLabelerHeader,
+  parseLabelerHeader,
+} from './util'
+import { httpLogger as log } from './logger'
+import { Dispatcher } from 'undici'
 
 export class AppContext {
   constructor(
     private opts: {
-      db: Database
-      imgUriBuilder: ImageUriBuilder
       cfg: ServerConfig
-      services: Services
-      didResolver: DidResolver
-      didCache: DidSqlCache
-      labeler: Labeler
+      dataplane: DataPlaneClient
+      searchAgent: AtpAgent | undefined
+      suggestionsAgent: AtpAgent | undefined
+      topicsAgent: AtpAgent | undefined
+      hydrator: Hydrator
+      views: Views
+      signingKey: Keypair
+      idResolver: IdResolver
+      bsyncClient: BsyncClient
+      courierClient: CourierClient | undefined
+      authVerifier: AuthVerifier
+      featureGates: FeatureGates
+      blobDispatcher: Dispatcher
     },
   ) {}
-
-  get db(): Database {
-    return this.opts.db
-  }
-
-  get imgUriBuilder(): ImageUriBuilder {
-    return this.opts.imgUriBuilder
-  }
 
   get cfg(): ServerConfig {
     return this.opts.cfg
   }
 
-  get services(): Services {
-    return this.opts.services
+  get dataplane(): DataPlaneClient {
+    return this.opts.dataplane
+  }
+
+  get searchAgent(): AtpAgent | undefined {
+    return this.opts.searchAgent
+  }
+
+  get suggestionsAgent(): AtpAgent | undefined {
+    return this.opts.suggestionsAgent
+  }
+
+  get topicsAgent(): AtpAgent | undefined {
+    return this.opts.topicsAgent
+  }
+
+  get hydrator(): Hydrator {
+    return this.opts.hydrator
+  }
+
+  get views(): Views {
+    return this.opts.views
+  }
+
+  get signingKey(): Keypair {
+    return this.opts.signingKey
   }
 
   get plcClient(): plc.Client {
     return new plc.Client(this.cfg.didPlcUrl)
   }
 
-  get didResolver(): DidResolver {
-    return this.opts.didResolver
+  get idResolver(): IdResolver {
+    return this.opts.idResolver
   }
 
-  get didCache(): DidSqlCache {
-    return this.opts.didCache
+  get bsyncClient(): BsyncClient {
+    return this.opts.bsyncClient
   }
 
-  get authVerifier() {
-    return auth.authVerifier(this.didResolver)
+  get courierClient(): CourierClient | undefined {
+    return this.opts.courierClient
   }
 
-  get authOptionalVerifier() {
-    return auth.authOptionalVerifier(this.didResolver)
+  get authVerifier(): AuthVerifier {
+    return this.opts.authVerifier
   }
 
-  get labeler(): Labeler {
-    return this.opts.labeler
+  get featureGates(): FeatureGates {
+    return this.opts.featureGates
+  }
+
+  get blobDispatcher(): Dispatcher {
+    return this.opts.blobDispatcher
+  }
+
+  reqLabelers(req: express.Request): ParsedLabelers {
+    const val = req.header('atproto-accept-labelers')
+    let parsed: ParsedLabelers | null
+    try {
+      parsed = parseLabelerHeader(val)
+    } catch (err) {
+      parsed = null
+      log.info({ err, val }, 'failed to parse labeler header')
+    }
+    if (!parsed) return defaultLabelerHeader(this.cfg.labelsFromIssuerDids)
+    return parsed
   }
 }
 

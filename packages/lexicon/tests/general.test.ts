@@ -1,5 +1,5 @@
 import { CID } from 'multiformats/cid'
-import { Lexicons } from '../src/index'
+import { LexiconDoc, Lexicons, parseLexiconDoc } from '../src/index'
 import LexiconDocs from './_scaffolds/lexicons'
 
 describe('Lexicons collection', () => {
@@ -83,6 +83,176 @@ describe('General validation', () => {
       if (res.success) throw new Error('Asserted')
       expect(res.error?.message).toBe('Object must have the property "object"')
     }
+  })
+  it('fails when a required property is missing', () => {
+    const schema = {
+      lexicon: 1,
+      id: 'com.example.kitchenSink',
+      defs: {
+        test: {
+          type: 'object',
+          required: ['foo'],
+          properties: {},
+        },
+      },
+    }
+    expect(() => {
+      parseLexiconDoc(schema)
+    }).toThrow('Required field \\"foo\\" not defined')
+  })
+  it('fails when unknown fields are present', () => {
+    const schema = {
+      lexicon: 1,
+      id: 'com.example.unknownFields',
+      defs: {
+        test: {
+          type: 'object',
+          foo: 3,
+        },
+      },
+    }
+
+    expect(() => {
+      parseLexiconDoc(schema)
+    }).toThrow("Unrecognized key(s) in object: 'foo'")
+  })
+  it('fails lexicon parsing when uri is invalid', () => {
+    const schema: LexiconDoc = {
+      lexicon: 1,
+      id: 'com.example.invalidUri',
+      defs: {
+        main: {
+          type: 'object',
+          properties: {
+            test: { type: 'ref', ref: 'com.example.invalid#test#test' },
+          },
+        },
+      },
+    }
+
+    expect(() => {
+      new Lexicons([schema])
+    }).toThrow('Uri can only have one hash segment')
+  })
+  it('fails validation when ref uri has multiple hash segments', () => {
+    const schema: LexiconDoc = {
+      lexicon: 1,
+      id: 'com.example.invalidUri',
+      defs: {
+        main: {
+          type: 'object',
+          properties: {
+            test: { type: 'integer' },
+          },
+        },
+        object: {
+          type: 'object',
+          required: ['test'],
+          properties: {
+            test: {
+              type: 'union',
+              refs: ['com.example.invalidUri'],
+            },
+          },
+        },
+      },
+    }
+    const lexicons = new Lexicons([schema])
+    expect(() => {
+      lexicons.validate('com.example.invalidUri#object', {
+        test: {
+          $type: 'com.example.invalidUri#main#main',
+          test: 123,
+        },
+      })
+    }).toThrow('Uri can only have one hash segment')
+  })
+  it('union handles both implicit and explicit #main', () => {
+    const schemas: LexiconDoc[] = [
+      {
+        lexicon: 1,
+        id: 'com.example.implicitMain',
+        defs: {
+          main: {
+            type: 'object',
+            required: ['test'],
+            properties: {
+              test: { type: 'string' },
+            },
+          },
+        },
+      },
+      {
+        lexicon: 1,
+        id: 'com.example.testImplicitMain',
+        defs: {
+          main: {
+            type: 'object',
+            required: ['union'],
+            properties: {
+              union: {
+                type: 'union',
+                refs: ['com.example.implicitMain'],
+              },
+            },
+          },
+        },
+      },
+      {
+        lexicon: 1,
+        id: 'com.example.testExplicitMain',
+        defs: {
+          main: {
+            type: 'object',
+            required: ['union'],
+            properties: {
+              union: {
+                type: 'union',
+                refs: ['com.example.implicitMain#main'],
+              },
+            },
+          },
+        },
+      },
+    ]
+
+    const lexicon = new Lexicons(schemas)
+
+    let result = lexicon.validate('com.example.testImplicitMain', {
+      union: {
+        $type: 'com.example.implicitMain',
+        test: 123,
+      },
+    })
+    expect(result.success).toBeFalsy()
+    expect(result['error']?.message).toBe('Object/union/test must be a string')
+
+    result = lexicon.validate('com.example.testImplicitMain', {
+      union: {
+        $type: 'com.example.implicitMain#main',
+        test: 123,
+      },
+    })
+    expect(result.success).toBeFalsy()
+    expect(result['error']?.message).toBe('Object/union/test must be a string')
+
+    result = lexicon.validate('com.example.testExplicitMain', {
+      union: {
+        $type: 'com.example.implicitMain',
+        test: 123,
+      },
+    })
+    expect(result.success).toBeFalsy()
+    expect(result['error']?.message).toBe('Object/union/test must be a string')
+
+    result = lexicon.validate('com.example.testExplicitMain', {
+      union: {
+        $type: 'com.example.implicitMain#main',
+        test: 123,
+      },
+    })
+    expect(result.success).toBeFalsy()
+    expect(result['error']?.message).toBe('Object/union/test must be a string')
   })
 })
 
@@ -397,45 +567,303 @@ describe('Record validation', () => {
   })
 
   it('Applies string length constraint', () => {
-    lex.assertValidRecord('com.example.stringLength', {
-      $type: 'com.example.stringLength',
-      string: '123',
-    })
+    // Shorter than two UTF8 characters
     expect(() =>
       lex.assertValidRecord('com.example.stringLength', {
         $type: 'com.example.stringLength',
-        string: '1',
+        string: '',
       }),
     ).toThrow('Record/string must not be shorter than 2 characters')
     expect(() =>
       lex.assertValidRecord('com.example.stringLength', {
         $type: 'com.example.stringLength',
-        string: '12345',
+        string: 'a',
+      }),
+    ).toThrow('Record/string must not be shorter than 2 characters')
+
+    // Two to four UTF8 characters
+    lex.assertValidRecord('com.example.stringLength', {
+      $type: 'com.example.stringLength',
+      string: 'ab',
+    })
+    lex.assertValidRecord('com.example.stringLength', {
+      $type: 'com.example.stringLength',
+      string: '\u0301', // Combining acute accent (2 bytes)
+    })
+    lex.assertValidRecord('com.example.stringLength', {
+      $type: 'com.example.stringLength',
+      string: 'a\u0301', // 'a' + combining acute accent (1 + 2 bytes = 3 bytes)
+    })
+    lex.assertValidRecord('com.example.stringLength', {
+      $type: 'com.example.stringLength',
+      string: 'aé', // 'a' (1 byte) + 'é' (2 bytes) = 3 bytes
+    })
+    lex.assertValidRecord('com.example.stringLength', {
+      $type: 'com.example.stringLength',
+      string: 'abc',
+    })
+    lex.assertValidRecord('com.example.stringLength', {
+      $type: 'com.example.stringLength',
+      string: '一', // CJK character (3 bytes)
+    })
+    lex.assertValidRecord('com.example.stringLength', {
+      $type: 'com.example.stringLength',
+      string: '\uD83D', // Unpaired high surrogate (3 bytes)
+    })
+    lex.assertValidRecord('com.example.stringLength', {
+      $type: 'com.example.stringLength',
+      string: 'abcd',
+    })
+    lex.assertValidRecord('com.example.stringLength', {
+      $type: 'com.example.stringLength',
+      string: 'éé', // 'é' + 'é' (2 + 2 bytes = 4 bytes)
+    })
+    lex.assertValidRecord('com.example.stringLength', {
+      $type: 'com.example.stringLength',
+      string: 'aaé', // 1 + 1 + 2 = 4 bytes
+    })
+    lex.assertValidRecord('com.example.stringLength', {
+      $type: 'com.example.stringLength',
+      string: '👋', // 4 bytes
+    })
+
+    expect(() =>
+      lex.assertValidRecord('com.example.stringLength', {
+        $type: 'com.example.stringLength',
+        string: 'abcde',
       }),
     ).toThrow('Record/string must not be longer than 4 characters')
     expect(() =>
       lex.assertValidRecord('com.example.stringLength', {
         $type: 'com.example.stringLength',
-        string: '👨‍👩‍👧‍👧',
+        string: 'a\u0301\u0301', // 1 + (2 * 2) = 5 bytes
+      }),
+    ).toThrow('Record/string must not be longer than 4 characters')
+    expect(() =>
+      lex.assertValidRecord('com.example.stringLength', {
+        $type: 'com.example.stringLength',
+        string: '\uD83D\uD83D', // Two unpaired high surrogates (3 * 2 = 6 bytes)
+      }),
+    ).toThrow('Record/string must not be longer than 4 characters')
+    expect(() =>
+      lex.assertValidRecord('com.example.stringLength', {
+        $type: 'com.example.stringLength',
+        string: 'ééé', // 2 + 2 + 2 bytes = 6 bytes
+      }),
+    ).toThrow('Record/string must not be longer than 4 characters')
+    expect(() =>
+      lex.assertValidRecord('com.example.stringLength', {
+        $type: 'com.example.stringLength',
+        string: '👋a', // 4 + 1 bytes = 5 bytes
+      }),
+    ).toThrow('Record/string must not be longer than 4 characters')
+    expect(() =>
+      lex.assertValidRecord('com.example.stringLength', {
+        $type: 'com.example.stringLength',
+        string: '👨👨', // 4 + 4 = 8 bytes
+      }),
+    ).toThrow('Record/string must not be longer than 4 characters')
+    expect(() =>
+      lex.assertValidRecord('com.example.stringLength', {
+        $type: 'com.example.stringLength',
+        string: '👨‍👩‍👧‍👧', // 4 emojis × 4 bytes + 3 ZWJs × 3 bytes = 25 bytes
+      }),
+    ).toThrow('Record/string must not be longer than 4 characters')
+  })
+
+  it('Applies string length constraint (no minLength)', () => {
+    // Shorter than two UTF8 characters
+    lex.assertValidRecord('com.example.stringLengthNoMinLength', {
+      $type: 'com.example.stringLengthNoMinLength',
+      string: '',
+    })
+    lex.assertValidRecord('com.example.stringLengthNoMinLength', {
+      $type: 'com.example.stringLengthNoMinLength',
+      string: 'a',
+    })
+
+    // Two to four UTF8 characters
+    lex.assertValidRecord('com.example.stringLengthNoMinLength', {
+      $type: 'com.example.stringLengthNoMinLength',
+      string: 'ab',
+    })
+    lex.assertValidRecord('com.example.stringLengthNoMinLength', {
+      $type: 'com.example.stringLengthNoMinLength',
+      string: '\u0301', // Combining acute accent (2 bytes)
+    })
+    lex.assertValidRecord('com.example.stringLengthNoMinLength', {
+      $type: 'com.example.stringLengthNoMinLength',
+      string: 'a\u0301', // 'a' + combining acute accent (1 + 2 bytes = 3 bytes)
+    })
+    lex.assertValidRecord('com.example.stringLengthNoMinLength', {
+      $type: 'com.example.stringLengthNoMinLength',
+      string: 'aé', // 'a' (1 byte) + 'é' (2 bytes) = 3 bytes
+    })
+    lex.assertValidRecord('com.example.stringLengthNoMinLength', {
+      $type: 'com.example.stringLengthNoMinLength',
+      string: 'abc',
+    })
+    lex.assertValidRecord('com.example.stringLengthNoMinLength', {
+      $type: 'com.example.stringLengthNoMinLength',
+      string: '一', // CJK character (3 bytes)
+    })
+    lex.assertValidRecord('com.example.stringLengthNoMinLength', {
+      $type: 'com.example.stringLengthNoMinLength',
+      string: '\uD83D', // Unpaired high surrogate (3 bytes)
+    })
+    lex.assertValidRecord('com.example.stringLengthNoMinLength', {
+      $type: 'com.example.stringLengthNoMinLength',
+      string: 'abcd',
+    })
+    lex.assertValidRecord('com.example.stringLengthNoMinLength', {
+      $type: 'com.example.stringLengthNoMinLength',
+      string: 'éé', // 'é' + 'é' (2 + 2 bytes = 4 bytes)
+    })
+    lex.assertValidRecord('com.example.stringLengthNoMinLength', {
+      $type: 'com.example.stringLengthNoMinLength',
+      string: 'aaé', // 1 + 1 + 2 = 4 bytes
+    })
+    lex.assertValidRecord('com.example.stringLengthNoMinLength', {
+      $type: 'com.example.stringLengthNoMinLength',
+      string: '👋', // 4 bytes
+    })
+
+    expect(() =>
+      lex.assertValidRecord('com.example.stringLengthNoMinLength', {
+        $type: 'com.example.stringLengthNoMinLength',
+        string: 'abcde',
+      }),
+    ).toThrow('Record/string must not be longer than 4 characters')
+    expect(() =>
+      lex.assertValidRecord('com.example.stringLengthNoMinLength', {
+        $type: 'com.example.stringLengthNoMinLength',
+        string: 'a\u0301\u0301', // 1 + (2 * 2) = 5 bytes
+      }),
+    ).toThrow('Record/string must not be longer than 4 characters')
+    expect(() =>
+      lex.assertValidRecord('com.example.stringLengthNoMinLength', {
+        $type: 'com.example.stringLengthNoMinLength',
+        string: '\uD83D\uD83D', // Two unpaired high surrogates (3 * 2 = 6 bytes)
+      }),
+    ).toThrow('Record/string must not be longer than 4 characters')
+    expect(() =>
+      lex.assertValidRecord('com.example.stringLengthNoMinLength', {
+        $type: 'com.example.stringLengthNoMinLength',
+        string: 'ééé', // 2 + 2 + 2 bytes = 6 bytes
+      }),
+    ).toThrow('Record/string must not be longer than 4 characters')
+    expect(() =>
+      lex.assertValidRecord('com.example.stringLengthNoMinLength', {
+        $type: 'com.example.stringLengthNoMinLength',
+        string: '👋a', // 4 + 1 bytes = 5 bytes
+      }),
+    ).toThrow('Record/string must not be longer than 4 characters')
+    expect(() =>
+      lex.assertValidRecord('com.example.stringLengthNoMinLength', {
+        $type: 'com.example.stringLengthNoMinLength',
+        string: '👨👨', // 4 + 4 = 8 bytes
+      }),
+    ).toThrow('Record/string must not be longer than 4 characters')
+    expect(() =>
+      lex.assertValidRecord('com.example.stringLengthNoMinLength', {
+        $type: 'com.example.stringLengthNoMinLength',
+        string: '👨‍👩‍👧‍👧', // 4 emojis × 4 bytes + 3 ZWJs × 3 bytes = 25 bytes
       }),
     ).toThrow('Record/string must not be longer than 4 characters')
   })
 
   it('Applies grapheme string length constraint', () => {
-    lex.assertValidRecord('com.example.stringLengthGrapheme', {
-      $type: 'com.example.stringLengthGrapheme',
-      string: '12👨‍👩‍👧‍👧',
-    })
+    // Shorter than two graphemes
+    expect(() =>
+      lex.assertValidRecord('com.example.stringLengthGrapheme', {
+        $type: 'com.example.stringLengthGrapheme',
+        string: '',
+      }),
+    ).toThrow('Record/string must not be shorter than 2 graphemes')
+    expect(() =>
+      lex.assertValidRecord('com.example.stringLengthGrapheme', {
+        $type: 'com.example.stringLengthGrapheme',
+        string: '\u0301\u0301\u0301', // Three combining acute accents
+      }),
+    ).toThrow('Record/string must not be shorter than 2 graphemes')
+    expect(() =>
+      lex.assertValidRecord('com.example.stringLengthGrapheme', {
+        $type: 'com.example.stringLengthGrapheme',
+        string: 'a',
+      }),
+    ).toThrow('Record/string must not be shorter than 2 graphemes')
+    expect(() =>
+      lex.assertValidRecord('com.example.stringLengthGrapheme', {
+        $type: 'com.example.stringLengthGrapheme',
+        string: 'a\u0301\u0301\u0301\u0301', // 'á́́́' ('a' with four combining acute accents)
+      }),
+    ).toThrow('Record/string must not be shorter than 2 graphemes')
+    expect(() =>
+      lex.assertValidRecord('com.example.stringLengthGrapheme', {
+        $type: 'com.example.stringLengthGrapheme',
+        string: '5\uFE0F', // '5️' with emoji presentation
+      }),
+    ).toThrow('Record/string must not be shorter than 2 graphemes')
     expect(() =>
       lex.assertValidRecord('com.example.stringLengthGrapheme', {
         $type: 'com.example.stringLengthGrapheme',
         string: '👨‍👩‍👧‍👧',
       }),
     ).toThrow('Record/string must not be shorter than 2 graphemes')
+
+    // Two to four graphemes
+    lex.assertValidRecord('com.example.stringLengthGrapheme', {
+      $type: 'com.example.stringLengthGrapheme',
+      string: 'ab',
+    })
+    lex.assertValidRecord('com.example.stringLengthGrapheme', {
+      $type: 'com.example.stringLengthGrapheme',
+      string: 'a\u0301b', // 'áb' with combining accent
+    })
+    lex.assertValidRecord('com.example.stringLengthGrapheme', {
+      $type: 'com.example.stringLengthGrapheme',
+      string: 'a\u0301b\u0301', // 'áb́'
+    })
+    lex.assertValidRecord('com.example.stringLengthGrapheme', {
+      $type: 'com.example.stringLengthGrapheme',
+      string: '😀😀',
+    })
+    lex.assertValidRecord('com.example.stringLengthGrapheme', {
+      $type: 'com.example.stringLengthGrapheme',
+      string: '12👨‍👩‍👧‍👧',
+    })
+    lex.assertValidRecord('com.example.stringLengthGrapheme', {
+      $type: 'com.example.stringLengthGrapheme',
+      string: 'abcd',
+    })
+    lex.assertValidRecord('com.example.stringLengthGrapheme', {
+      $type: 'com.example.stringLengthGrapheme',
+      string: 'a\u0301b\u0301c\u0301d\u0301', // 'áb́ćd́'
+    })
+
+    // Longer than four graphemes
     expect(() =>
       lex.assertValidRecord('com.example.stringLengthGrapheme', {
         $type: 'com.example.stringLengthGrapheme',
-        string: '12345',
+        string: 'abcde',
+      }),
+    ).toThrow('Record/string must not be longer than 4 graphemes')
+    expect(() =>
+      lex.assertValidRecord('com.example.stringLengthGrapheme', {
+        $type: 'com.example.stringLengthGrapheme',
+        string: 'a\u0301b\u0301c\u0301d\u0301e\u0301', // 'áb́ćd́é'
+      }),
+    ).toThrow('Record/string must not be longer than 4 graphemes')
+    expect(() =>
+      lex.assertValidRecord('com.example.stringLengthGrapheme', {
+        $type: 'com.example.stringLengthGrapheme',
+        string: '😀😀😀😀😀',
+      }),
+    ).toThrow('Record/string must not be longer than 4 graphemes')
+    expect(() =>
+      lex.assertValidRecord('com.example.stringLengthGrapheme', {
+        $type: 'com.example.stringLengthGrapheme',
+        string: 'ab😀de',
       }),
     ).toThrow('Record/string must not be longer than 4 graphemes')
   })
@@ -489,7 +917,9 @@ describe('Record validation', () => {
         $type: 'com.example.datetime',
         datetime: 'bad date',
       }),
-    ).toThrow('Record/datetime must be an iso8601 formatted datetime')
+    ).toThrow(
+      'Record/datetime must be an valid atproto datetime (both RFC-3339 and ISO-8601)',
+    )
   })
 
   it('Applies uri formatting constraint', () => {
@@ -633,6 +1063,19 @@ describe('Record validation', () => {
         cid: 'abapsdofiuwrpoiasdfuaspdfoiu',
       }),
     ).toThrow('Record/cid must be a cid string')
+  })
+
+  it('Applies language formatting constraint', () => {
+    lex.assertValidRecord('com.example.language', {
+      $type: 'com.example.language',
+      language: 'en-US-boont',
+    })
+    expect(() =>
+      lex.assertValidRecord('com.example.language', {
+        $type: 'com.example.language',
+        language: 'not-a-language-',
+      }),
+    ).toThrow('Record/language must be a well-formed BCP 47 language tag')
   })
 
   it('Applies bytes length constraints', () => {

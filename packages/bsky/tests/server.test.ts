@@ -1,28 +1,33 @@
-import { AddressInfo } from 'net'
+import { TestNetwork, basicSeed } from '@atproto/dev-env'
 import express from 'express'
-import axios, { AxiosError } from 'axios'
-import { runTestEnv, TestEnvInfo } from '@atproto/dev-env'
+import { once } from 'node:events'
+import { AddressInfo } from 'node:net'
+import { finished } from 'node:stream/promises'
+import { request } from 'undici'
 import { handler as errorHandler } from '../src/error'
-import { Database } from '../src'
+import { startServer } from './_util'
 
 describe('server', () => {
-  let testEnv: TestEnvInfo
-  let db: Database
+  let network: TestNetwork
+  let alice: string
 
   beforeAll(async () => {
-    testEnv = await runTestEnv({
+    network = await TestNetwork.create({
       dbPostgresSchema: 'bsky_server',
     })
-    db = testEnv.bsky.ctx.db
+    const sc = network.getSeedClient()
+    await basicSeed(sc)
+    await network.processAll()
+    alice = sc.dids.alice
   })
 
   afterAll(async () => {
-    await testEnv.close()
+    await network.close()
   })
 
   it('preserves 404s.', async () => {
-    const promise = axios.get(`${testEnv.bsky.url}/unknown`)
-    await expect(promise).rejects.toThrow('failed with status code 404')
+    const response = await fetch(`${network.bsky.url}/unknown`)
+    expect(response.status).toEqual(404)
   })
 
   it('error handler turns unknown errors into 500s.', async () => {
@@ -31,73 +36,82 @@ describe('server', () => {
       throw new Error('Oops!')
     })
     app.use(errorHandler)
-    const srv = app.listen()
-    const port = (srv.address() as AddressInfo).port
-    const promise = axios.get(`http://localhost:${port}/oops`)
-    await expect(promise).rejects.toThrow('failed with status code 500')
-    srv.close()
+    const { origin, stop } = await startServer(app)
     try {
-      await promise
-    } catch (err: unknown) {
-      const axiosError = err as AxiosError
-      expect(axiosError.response?.status).toEqual(500)
-      expect(axiosError.response?.data).toEqual({
+      const response = await fetch(new URL(`/oops`, origin))
+      expect(response.status).toEqual(500)
+      await expect(response.json()).resolves.toEqual({
         error: 'InternalServerError',
         message: 'Internal Server Error',
       })
+    } finally {
+      await stop()
     }
   })
 
   it('healthcheck succeeds when database is available.', async () => {
-    const { data, status } = await axios.get(`${testEnv.bsky.url}/xrpc/_health`)
-    expect(status).toEqual(200)
-    expect(data).toEqual({ version: '0.0.0' })
+    const response = await fetch(`${network.bsky.url}/xrpc/_health`)
+    expect(response.status).toEqual(200)
+    await expect(response.json()).resolves.toEqual({ version: 'unknown' })
   })
 
   // TODO(bsky) check on a different endpoint that accepts json, currently none.
   it.skip('limits size of json input.', async () => {
-    let error: AxiosError
-    try {
-      await axios.post(
-        `${testEnv.bsky.url}/xrpc/com.atproto.repo.createRecord`,
-        {
-          data: 'x'.repeat(100 * 1024), // 100kb
-        },
-        // { headers: sc.getHeaders(alice) },
-      )
-      throw new Error('Request should have failed')
-    } catch (err) {
-      if (axios.isAxiosError(err)) {
-        error = err
-      } else {
-        throw err
-      }
-    }
-    expect(error.response?.status).toEqual(413)
-    expect(error.response?.data).toEqual({
+    const response = await fetch(
+      `${network.bsky.url}/xrpc/com.atproto.repo.createRecord`,
+      {
+        body: 'x'.repeat(100 * 1024), // 100kb
+      },
+    )
+
+    expect(response.status).toEqual(413)
+    await expect(response.json()).resolves.toEqual({
       error: 'PayloadTooLargeError',
       message: 'request entity too large',
     })
   })
 
-  it('healthcheck fails when database is unavailable.', async () => {
-    await testEnv.bsky.sub.destroy()
-    await db.close()
-    let error: AxiosError
-    try {
-      await axios.get(`${testEnv.bsky.url}/xrpc/_health`)
-      throw new Error('Healthcheck should have failed')
-    } catch (err) {
-      if (axios.isAxiosError(err)) {
-        error = err
-      } else {
-        throw err
-      }
-    }
-    expect(error.response?.status).toEqual(503)
-    expect(error.response?.data).toEqual({
-      version: '0.0.0',
-      error: 'Service Unavailable',
+  it('compresses large json responses', async () => {
+    const res = await request(
+      `${network.bsky.url}/xrpc/app.bsky.feed.getTimeline`,
+      {
+        headers: {
+          ...(await network.serviceHeaders(alice, 'app.bsky.feed.getTimeline')),
+          'accept-encoding': 'gzip',
+        },
+      },
+    )
+
+    await finished(res.body.resume())
+
+    expect(res.headers['content-encoding']).toEqual('gzip')
+  })
+
+  it('does not compress small payloads', async () => {
+    const res = await request(`${network.bsky.url}/xrpc/_health`, {
+      headers: { 'accept-encoding': 'gzip' },
     })
+
+    await finished(res.body.resume())
+
+    expect(res.headers['content-encoding']).toBeUndefined()
+  })
+
+  it('healthcheck fails when dataplane is unavailable.', async () => {
+    const { port } = network.bsky.dataplane.server.address() as AddressInfo
+    await network.bsky.dataplane.destroy()
+
+    try {
+      const response = await fetch(`${network.bsky.url}/xrpc/_health`)
+      expect(response.status).toEqual(503)
+      await expect(response.json()).resolves.toEqual({
+        version: 'unknown',
+        error: 'Service Unavailable',
+      })
+    } finally {
+      // restart dataplane server to allow test suite to cleanup
+      network.bsky.dataplane.server.listen(port)
+      await once(network.bsky.dataplane.server, 'listening')
+    }
   })
 })

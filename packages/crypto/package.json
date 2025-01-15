@@ -1,33 +1,32 @@
 {
   "name": "@atproto/crypto",
-  "version": "0.1.1",
-  "main": "src/index.ts",
+  "version": "0.4.3",
   "license": "MIT",
+  "description": "Library for cryptographic keys and signing in atproto",
+  "keywords": [
+    "atproto",
+    "cryptography"
+  ],
+  "homepage": "https://atproto.com",
   "repository": {
     "type": "git",
-    "url": "https://github.com/bluesky-social/atproto.git",
+    "url": "https://github.com/bluesky-social/atproto",
     "directory": "packages/crypto"
   },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
   "scripts": {
     "test": "jest ",
-    "prettier": "prettier --check src/",
-    "prettier:fix": "prettier --write src/",
-    "lint": "eslint . --ext .ts,.tsx",
-    "lint:fix": "yarn lint --fix",
-    "verify": "run-p prettier lint",
-    "verify:fix": "yarn prettier:fix && yarn lint:fix",
-    "build": "node ./build.js",
-    "postbuild": "tsc --build tsconfig.build.json",
-    "update-main-to-dist": "node ./update-pkg.js --update-main-to-dist",
-    "update-main-to-src": "node ./update-pkg.js --update-main-to-src",
-    "prepublish": "npm run update-main-to-dist",
-    "postpublish": "npm run update-main-to-src"
+    "build": "tsc --build tsconfig.build.json"
   },
   "dependencies": {
-    "@noble/secp256k1": "^1.7.0",
-    "big-integer": "^1.6.51",
-    "multiformats": "^9.6.4",
-    "one-webcrypto": "^1.0.3",
+    "@noble/curves": "^1.7.0",
+    "@noble/hashes": "^1.6.1",
     "uint8arrays": "3.0.0"
+  },
+  "devDependencies": {
+    "@atproto/common": "workspace:^",
+    "jest": "^28.1.2",
+    "typescript": "^5.6.3"
   }
 }
