@@ -1,11 +1,12 @@
+import { EXAMPLE_LABELER, SeedClient, TestBsky } from '@atproto/dev-env'
 import { ids } from '../../src/lexicon/lexicons'
-import { FLAG } from '../../src/lexicon/types/com/atproto/admin/defs'
-import { adminAuth } from '../_util'
-import { SeedClient } from './client'
 import usersSeed from './users'
 
-export default async (sc: SeedClient) => {
-  await usersSeed(sc)
+export default async (
+  sc: SeedClient,
+  opts?: { inviteCode?: string; addModLabels?: TestBsky },
+) => {
+  await usersSeed(sc, opts)
 
   const alice = sc.dids.alice
   const bob = sc.dids.bob
@@ -25,16 +26,23 @@ export default async (sc: SeedClient) => {
   await sc.follow(bob, alice)
   await sc.follow(bob, carol, createdAtMicroseconds())
   await sc.follow(dan, bob, createdAtTimezone())
-  await sc.post(alice, posts.alice[0])
-  await sc.post(bob, posts.bob[0])
+  await sc.post(alice, posts.alice[0], undefined, undefined, undefined, {
+    labels: {
+      $type: 'com.atproto.label.defs#selfLabels',
+      values: [{ val: 'self-label' }],
+    },
+  })
+  await sc.post(bob, posts.bob[0], undefined, undefined, undefined, {
+    langs: ['en-US', 'i-klingon'],
+  })
   const img1 = await sc.uploadFile(
     carol,
-    'tests/image/fixtures/key-landscape-small.jpg',
+    '../dev-env/assets/key-landscape-small.jpg',
     'image/jpeg',
   )
   const img2 = await sc.uploadFile(
     carol,
-    'tests/image/fixtures/key-alt.jpg',
+    '../dev-env/assets/key-alt.jpg',
     'image/jpeg',
   )
   await sc.post(
@@ -95,9 +103,11 @@ export default async (sc: SeedClient) => {
 
   const replyImg = await sc.uploadFile(
     bob,
-    'tests/image/fixtures/key-landscape-small.jpg',
+    '../dev-env/assets/key-landscape-small.jpg',
     'image/jpeg',
   )
+  // must ensure ordering of replies in indexing
+  await sc.network.processAll()
   await sc.reply(
     bob,
     sc.posts[alice][1].ref,
@@ -112,7 +122,8 @@ export default async (sc: SeedClient) => {
     sc.posts[alice][1].ref,
     replies.carol[0],
   )
-  await sc.reply(
+  await sc.network.processAll()
+  const alicesReplyToBob = await sc.reply(
     alice,
     sc.posts[alice][1].ref,
     sc.replies[bob][0].ref,
@@ -120,23 +131,11 @@ export default async (sc: SeedClient) => {
   )
   await sc.repost(carol, sc.posts[dan][1].ref)
   await sc.repost(dan, sc.posts[alice][1].ref)
+  await sc.repost(dan, alicesReplyToBob.ref)
 
-  await sc.agent.com.atproto.admin.takeModerationAction(
-    {
-      action: FLAG,
-      subject: {
-        $type: 'com.atproto.admin.defs#repoRef',
-        did: dan,
-      },
-      createdBy: 'did:example:admin',
-      reason: 'test',
-      createLabelVals: ['repo-action-label'],
-    },
-    {
-      encoding: 'application/json',
-      headers: { authorization: adminAuth() },
-    },
-  )
+  if (opts?.addModLabels) {
+    await createLabel(opts.addModLabels, { did: dan, val: 'repo-action-label' })
+  }
 
   return sc
 }
@@ -152,4 +151,21 @@ export const replies = {
   alice: ['thanks bob'],
   bob: ['hear that label_me label_me_2'],
   carol: ['of course'],
+}
+
+const createLabel = async (
+  bsky: TestBsky,
+  opts: { did: string; val: string },
+) => {
+  await bsky.db.db
+    .insertInto('label')
+    .values({
+      uri: opts.did,
+      cid: '',
+      val: opts.val,
+      cts: new Date().toISOString(),
+      neg: false,
+      src: EXAMPLE_LABELER,
+    })
+    .execute()
 }

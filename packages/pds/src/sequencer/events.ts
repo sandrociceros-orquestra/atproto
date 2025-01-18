@@ -1,4 +1,3 @@
-import Database from '../db'
 import { z } from 'zod'
 import { cborEncode, schema } from '@atproto/common'
 import {
@@ -6,35 +5,12 @@ import {
   blocksToCarFile,
   CidSet,
   CommitData,
-  RebaseData,
   WriteOpAction,
 } from '@atproto/repo'
 import { PreparedWrite } from '../repo'
 import { CID } from 'multiformats/cid'
-import { EventType, RepoSeqInsert } from '../db/tables/repo-seq'
-
-export const sequenceEvt = async (
-  dbTxn: Database,
-  evt: RepoSeqInsert,
-): Promise<number> => {
-  await dbTxn.notify('repo_seq')
-  if (evt.eventType === 'rebase') {
-    await invalidatePrevRepoOps(dbTxn, evt.did)
-  } else if (evt.eventType === 'handle') {
-    await invalidatePrevHandleOps(dbTxn, evt.did)
-  }
-
-  const res = await dbTxn.db
-    .insertInto('repo_seq')
-    .values(evt)
-    .returning('seq')
-    .executeTakeFirst()
-  if (!res) {
-    throw new Error(`Failed to sequence evt: ${evt}`)
-  }
-
-  return res.seq
-}
+import { RepoSeqInsert } from './db'
+import { AccountStatus } from '../account-manager'
 
 export const formatSeqCommit = async (
   did: string,
@@ -46,12 +22,19 @@ export const formatSeqCommit = async (
   const blobs = new CidSet()
   let carSlice: Uint8Array
 
+  const blocksToSend = new BlockMap()
+  blocksToSend.addMap(commitData.newBlocks)
+  blocksToSend.addMap(commitData.relevantBlocks)
+
   // max 200 ops or 1MB of data
-  if (writes.length > 200 || commitData.blocks.byteSize > 1000000) {
+  if (writes.length > 200 || blocksToSend.byteSize > 1000000) {
     tooBig = true
     const justRoot = new BlockMap()
-    justRoot.add(commitData.blocks.get(commitData.commit))
-    carSlice = await blocksToCarFile(commitData.commit, justRoot)
+    const rootBlock = blocksToSend.get(commitData.cid)
+    if (rootBlock) {
+      justRoot.set(commitData.cid, rootBlock)
+    }
+    carSlice = await blocksToCarFile(commitData.cid, justRoot)
   } else {
     tooBig = false
     for (const w of writes) {
@@ -67,15 +50,17 @@ export const formatSeqCommit = async (
       }
       ops.push({ action: w.action, path, cid })
     }
-    carSlice = await blocksToCarFile(commitData.commit, commitData.blocks)
+    carSlice = await blocksToCarFile(commitData.cid, blocksToSend)
   }
 
   const evt: CommitEvt = {
     rebase: false,
     tooBig,
     repo: did,
-    commit: commitData.commit,
+    commit: commitData.cid,
     prev: commitData.prev,
+    rev: commitData.rev,
+    since: commitData.since,
     ops,
     blocks: carSlice,
     blobs: blobs.toList(),
@@ -83,30 +68,6 @@ export const formatSeqCommit = async (
   return {
     did,
     eventType: 'append' as const,
-    event: cborEncode(evt),
-    sequencedAt: new Date().toISOString(),
-  }
-}
-
-export const formatSeqRebase = async (
-  did: string,
-  rebaseData: RebaseData,
-): Promise<RepoSeqInsert> => {
-  const carSlice = await blocksToCarFile(rebaseData.commit, rebaseData.blocks)
-
-  const evt: CommitEvt = {
-    rebase: true,
-    tooBig: false,
-    repo: did,
-    commit: rebaseData.commit,
-    prev: rebaseData.rebased,
-    ops: [],
-    blocks: carSlice,
-    blobs: [],
-  }
-  return {
-    did,
-    eventType: 'rebase',
     event: cborEncode(evt),
     sequencedAt: new Date().toISOString(),
   }
@@ -128,27 +89,56 @@ export const formatSeqHandleUpdate = async (
   }
 }
 
-export const invalidatePrevSeqEvts = async (
-  db: Database,
+export const formatSeqIdentityEvt = async (
   did: string,
-  eventTypes: EventType[],
-) => {
-  if (eventTypes.length < 1) return
-  await db.db
-    .updateTable('repo_seq')
-    .where('did', '=', did)
-    .where('eventType', 'in', eventTypes)
-    .where('invalidated', '=', 0)
-    .set({ invalidated: 1 })
-    .execute()
+  handle?: string,
+): Promise<RepoSeqInsert> => {
+  const evt: IdentityEvt = {
+    did,
+  }
+  if (handle) {
+    evt.handle = handle
+  }
+  return {
+    did,
+    eventType: 'identity',
+    event: cborEncode(evt),
+    sequencedAt: new Date().toISOString(),
+  }
 }
 
-export const invalidatePrevRepoOps = async (db: Database, did: string) => {
-  return invalidatePrevSeqEvts(db, did, ['append', 'rebase'])
+export const formatSeqAccountEvt = async (
+  did: string,
+  status: AccountStatus,
+): Promise<RepoSeqInsert> => {
+  const evt: AccountEvt = {
+    did,
+    active: status === 'active',
+  }
+  if (status !== AccountStatus.Active) {
+    evt.status = status
+  }
+
+  return {
+    did,
+    eventType: 'account',
+    event: cborEncode(evt),
+    sequencedAt: new Date().toISOString(),
+  }
 }
 
-export const invalidatePrevHandleOps = async (db: Database, did: string) => {
-  return invalidatePrevSeqEvts(db, did, ['handle'])
+export const formatSeqTombstone = async (
+  did: string,
+): Promise<RepoSeqInsert> => {
+  const evt: TombstoneEvt = {
+    did,
+  }
+  return {
+    did,
+    eventType: 'tombstone',
+    event: cborEncode(evt),
+    sequencedAt: new Date().toISOString(),
+  }
 }
 
 export const commitEvtOp = z.object({
@@ -168,6 +158,8 @@ export const commitEvt = z.object({
   repo: z.string(),
   commit: schema.cid,
   prev: schema.cid.nullable(),
+  rev: z.string(),
+  since: z.string().nullable(),
   blocks: schema.bytes,
   ops: z.array(commitEvtOp),
   blobs: z.array(schema.cid),
@@ -179,6 +171,31 @@ export const handleEvt = z.object({
   handle: z.string(),
 })
 export type HandleEvt = z.infer<typeof handleEvt>
+
+export const identityEvt = z.object({
+  did: z.string(),
+  handle: z.string().optional(),
+})
+export type IdentityEvt = z.infer<typeof identityEvt>
+
+export const accountEvt = z.object({
+  did: z.string(),
+  active: z.boolean(),
+  status: z
+    .enum([
+      AccountStatus.Takendown,
+      AccountStatus.Suspended,
+      AccountStatus.Deleted,
+      AccountStatus.Deactivated,
+    ])
+    .optional(),
+})
+export type AccountEvt = z.infer<typeof accountEvt>
+
+export const tombstoneEvt = z.object({
+  did: z.string(),
+})
+export type TombstoneEvt = z.infer<typeof tombstoneEvt>
 
 type TypedCommitEvt = {
   type: 'commit'
@@ -192,4 +209,27 @@ type TypedHandleEvt = {
   time: string
   evt: HandleEvt
 }
-export type SeqEvt = TypedCommitEvt | TypedHandleEvt
+type TypedIdentityEvt = {
+  type: 'identity'
+  seq: number
+  time: string
+  evt: IdentityEvt
+}
+type TypedAccountEvt = {
+  type: 'account'
+  seq: number
+  time: string
+  evt: AccountEvt
+}
+type TypedTombstoneEvt = {
+  type: 'tombstone'
+  seq: number
+  time: string
+  evt: TombstoneEvt
+}
+export type SeqEvt =
+  | TypedCommitEvt
+  | TypedHandleEvt
+  | TypedIdentityEvt
+  | TypedAccountEvt
+  | TypedTombstoneEvt

@@ -4,11 +4,10 @@
   "defs": {
     "main": {
       "type": "query",
-      "description": "Get private preferences attached to the account.",
+      "description": "Get private preferences attached to the current account. Expected use is synchronization between multiple devices, and import/export during account migration. Requires auth.",
       "parameters": {
         "type": "params",
-        "properties": {
-        }
+        "properties": {}
       },
       "output": {
         "encoding": "application/json",

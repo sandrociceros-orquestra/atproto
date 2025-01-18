@@ -4,15 +4,8 @@ import {
   SourceFile,
   VariableDeclarationKind,
 } from 'ts-morph'
-import {
-  Lexicons,
-  LexiconDoc,
-  LexXrpcProcedure,
-  LexXrpcQuery,
-  LexRecord,
-  LexXrpcSubscription,
-} from '@atproto/lexicon'
-import { NSID } from '@atproto/nsid'
+import { Lexicons, LexiconDoc } from '@atproto/lexicon'
+import { NSID } from '@atproto/syntax'
 import { gen, lexiconsTs, utilTs } from './common'
 import { GeneratedAPI } from '../types'
 import {
@@ -183,12 +176,50 @@ const indexTs = (
       )
 
     file.addTypeAlias({
+      name: 'SharedRateLimitOpts',
+      typeParameters: [{ name: 'T' }],
+      type: `{
+        name: string
+        calcKey?: (ctx: T) => string | null
+        calcPoints?: (ctx: T) => number
+      }`,
+    })
+
+    file.addTypeAlias({
+      name: 'RouteRateLimitOpts',
+      typeParameters: [{ name: 'T' }],
+      type: `{
+        durationMs: number
+        points: number
+        calcKey?: (ctx: T) => string | null
+        calcPoints?: (ctx: T) => number
+      }`,
+    })
+
+    file.addTypeAlias({
+      name: 'HandlerOpts',
+      type: `{ blobLimit?: number }`,
+    })
+
+    file.addTypeAlias({
+      name: 'HandlerRateLimitOpts',
+      typeParameters: [{ name: 'T' }],
+      type: `SharedRateLimitOpts<T> | RouteRateLimitOpts<T>`,
+    })
+
+    file.addTypeAlias({
       name: 'ConfigOf',
-      typeParameters: [{ name: 'Auth' }, { name: 'Handler' }],
+      typeParameters: [
+        { name: 'Auth' },
+        { name: 'Handler' },
+        { name: 'ReqCtx' },
+      ],
       type: `
         | Handler
         | {
           auth?: Auth
+          opts?: HandlerOpts
+          rateLimit?: HandlerRateLimitOpts<ReqCtx> | HandlerRateLimitOpts<ReqCtx>[]
           handler: Handler
         }`,
     })
@@ -269,7 +300,7 @@ function genNamespaceCls(file: SourceFile, ns: DefTreeNode) {
     })
     method.addParameter({
       name: 'cfg',
-      type: `ConfigOf<AV, ${moduleName}.Handler<ExtractAuth<AV>>>`,
+      type: `ConfigOf<AV, ${moduleName}.Handler<ExtractAuth<AV>>, ${moduleName}.HandlerReqCtx<ExtractAuth<AV>>>`,
     })
     const methodType = isSubscription ? 'streamMethod' : 'method'
     method.setBodyText(
@@ -373,12 +404,11 @@ function genServerXrpcMethod(
   lexicons: Lexicons,
   lexUri: string,
 ) {
-  const def = lexicons.getDefOrThrow(lexUri, ['query', 'procedure']) as
-    | LexXrpcQuery
-    | LexXrpcProcedure
+  const def = lexicons.getDefOrThrow(lexUri, ['query', 'procedure'])
+
   file.addImportDeclaration({
     moduleSpecifier: '@atproto/xrpc-server',
-    namedImports: [{ name: 'HandlerAuth' }],
+    namedImports: [{ name: 'HandlerAuth' }, { name: 'HandlerPipeThrough' }],
   })
   //= export interface HandlerInput {...}
   if (def.type === 'procedure' && def.input?.encoding) {
@@ -422,6 +452,7 @@ function genServerXrpcMethod(
       name: 'HandlerSuccess',
       isExported: true,
     })
+
     if (def.output.encoding) {
       handlerSuccess.addProperty({
         name: 'encoding',
@@ -446,6 +477,10 @@ function genServerXrpcMethod(
         type: 'Uint8Array | stream.Readable',
       })
     }
+    handlerSuccess.addProperty({
+      name: 'headers?',
+      type: '{ [key: string]: string }',
+    })
   }
 
   // export interface HandlerError {...}
@@ -468,7 +503,24 @@ function genServerXrpcMethod(
   file.addTypeAlias({
     isExported: true,
     name: 'HandlerOutput',
-    type: `HandlerError | ${hasHandlerSuccess ? 'HandlerSuccess' : 'void'}`,
+    type: `HandlerError | ${
+      hasHandlerSuccess ? 'HandlerSuccess | HandlerPipeThrough' : 'void'
+    }`,
+  })
+
+  file.addTypeAlias({
+    name: 'HandlerReqCtx',
+    isExported: true,
+    typeParameters: [
+      { name: 'HA', constraint: 'HandlerAuth', default: 'never' },
+    ],
+    type: `{
+        auth: HA
+        params: QueryParams
+        input: HandlerInput
+        req: express.Request
+        res: express.Response
+      }`,
   })
 
   file.addTypeAlias({
@@ -477,13 +529,7 @@ function genServerXrpcMethod(
     typeParameters: [
       { name: 'HA', constraint: 'HandlerAuth', default: 'never' },
     ],
-    type: `(ctx: {
-        auth: HA
-        params: QueryParams
-        input: HandlerInput
-        req: express.Request
-        res: express.Response
-      }) => Promise<HandlerOutput> | HandlerOutput`,
+    type: `(ctx: HandlerReqCtx<HA>) => Promise<HandlerOutput> | HandlerOutput`,
   })
 }
 
@@ -492,9 +538,7 @@ function genServerXrpcStreaming(
   lexicons: Lexicons,
   lexUri: string,
 ) {
-  const def = lexicons.getDefOrThrow(lexUri, [
-    'subscription',
-  ]) as LexXrpcSubscription
+  const def = lexicons.getDefOrThrow(lexUri, ['subscription'])
 
   file.addImportDeclaration({
     moduleSpecifier: '@atproto/xrpc-server',
@@ -521,17 +565,26 @@ function genServerXrpcStreaming(
   })
 
   file.addTypeAlias({
+    name: 'HandlerReqCtx',
+    isExported: true,
+    typeParameters: [
+      { name: 'HA', constraint: 'HandlerAuth', default: 'never' },
+    ],
+    type: `{
+        auth: HA
+        params: QueryParams
+        req: IncomingMessage
+        signal: AbortSignal
+      }`,
+  })
+
+  file.addTypeAlias({
     name: 'Handler',
     isExported: true,
     typeParameters: [
       { name: 'HA', constraint: 'HandlerAuth', default: 'never' },
     ],
-    type: `(ctx: {
-        auth: HA
-        params: QueryParams
-        req: IncomingMessage
-        signal: AbortSignal
-      }) => AsyncIterable<HandlerOutput>`,
+    type: `(ctx: HandlerReqCtx<HA>) => AsyncIterable<HandlerOutput>`,
   })
 }
 
@@ -541,7 +594,7 @@ function genServerRecord(
   lexicons: Lexicons,
   lexUri: string,
 ) {
-  const def = lexicons.getDefOrThrow(lexUri, ['record']) as LexRecord
+  const def = lexicons.getDefOrThrow(lexUri, ['record'])
 
   //= export interface Record {...}
   genObject(file, imports, lexUri, def.record, 'Record')

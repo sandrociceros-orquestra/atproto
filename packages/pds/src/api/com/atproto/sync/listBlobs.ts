@@ -1,35 +1,32 @@
-import { CID } from 'multiformats/cid'
-import { InvalidRequestError } from '@atproto/xrpc-server'
 import { Server } from '../../../../lexicon'
-import SqlRepoStorage from '../../../../sql-repo-storage'
 import AppContext from '../../../../context'
+import { assertRepoAvailability } from './util'
+import { AuthScope } from '../../../../auth-verifier'
 
 export default function (server: Server, ctx: AppContext) {
-  server.com.atproto.sync.listBlobs(async ({ params }) => {
-    const { did } = params
-    const storage = new SqlRepoStorage(ctx.db, did)
-    const earliest = params.earliest ? CID.parse(params.earliest) : null
-    const latest = params.latest
-      ? CID.parse(params.latest)
-      : await storage.getHead()
-    if (latest === null) {
-      throw new InvalidRequestError(`Could not find root for DID: ${did}`)
-    }
-    const commitPath = await storage.getCommitPath(latest, earliest)
-    if (commitPath === null) {
-      throw new InvalidRequestError(
-        `Could not find a valid commit path from ${latest.toString()} to ${earliest?.toString()}`,
+  server.com.atproto.sync.listBlobs({
+    auth: ctx.authVerifier.optionalAccessOrAdminToken({
+      additional: [AuthScope.Takendown],
+    }),
+    handler: async ({ params, auth }) => {
+      const { did, since, limit, cursor } = params
+      await assertRepoAvailability(
+        ctx,
+        did,
+        ctx.authVerifier.isUserOrAdmin(auth, did),
       )
-    }
-    const cids = await ctx.services
-      .repo(ctx.db)
-      .blobs.listForCommits(did, commitPath)
 
-    return {
-      encoding: 'application/json',
-      body: {
-        cids: cids.map((c) => c.toString()),
-      },
-    }
+      const blobCids = await ctx.actorStore.read(did, (store) =>
+        store.repo.blob.listBlobs({ since, limit, cursor }),
+      )
+
+      return {
+        encoding: 'application/json',
+        body: {
+          cursor: blobCids.at(-1),
+          cids: blobCids,
+        },
+      }
+    },
   })
 }

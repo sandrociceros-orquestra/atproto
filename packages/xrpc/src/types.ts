@@ -2,25 +2,20 @@ import { z } from 'zod'
 import { ValidationError } from '@atproto/lexicon'
 
 export type QueryParams = Record<string, any>
-export type Headers = Record<string, string>
+export type HeadersMap = Record<string, string>
+
+export type {
+  /** @deprecated not to be confused with the WHATWG Headers constructor */
+  HeadersMap as Headers,
+}
+
+export type Gettable<T> = T | (() => T)
 
 export interface CallOptions {
   encoding?: string
-  headers?: Headers
+  signal?: AbortSignal
+  headers?: HeadersMap
 }
-
-export interface FetchHandlerResponse {
-  status: number
-  headers: Headers
-  body: ArrayBuffer | undefined
-}
-
-export type FetchHandler = (
-  httpUri: string,
-  httpMethod: string,
-  httpHeaders: Headers,
-  httpReqBody: any,
-) => Promise<FetchHandlerResponse>
 
 export const errorResponseBody = z.object({
   error: z.string().optional(),
@@ -36,16 +31,35 @@ export enum ResponseType {
   AuthRequired = 401,
   Forbidden = 403,
   XRPCNotSupported = 404,
+  NotAcceptable = 406,
   PayloadTooLarge = 413,
+  UnsupportedMediaType = 415,
   RateLimitExceeded = 429,
   InternalServerError = 500,
   MethodNotImplemented = 501,
   UpstreamFailure = 502,
-  NotEnoughResouces = 503,
+  NotEnoughResources = 503,
   UpstreamTimeout = 504,
 }
 
+export function httpResponseCodeToEnum(status: number): ResponseType {
+  if (status in ResponseType) {
+    return status
+  } else if (status >= 100 && status < 200) {
+    return ResponseType.XRPCNotSupported
+  } else if (status >= 200 && status < 300) {
+    return ResponseType.Success
+  } else if (status >= 300 && status < 400) {
+    return ResponseType.XRPCNotSupported
+  } else if (status >= 400 && status < 500) {
+    return ResponseType.InvalidRequest
+  } else {
+    return ResponseType.InternalServerError
+  }
+}
+
 export const ResponseTypeNames = {
+  [ResponseType.Unknown]: 'Unknown',
   [ResponseType.InvalidResponse]: 'InvalidResponse',
   [ResponseType.Success]: 'Success',
   [ResponseType.InvalidRequest]: 'InvalidRequest',
@@ -53,15 +67,21 @@ export const ResponseTypeNames = {
   [ResponseType.Forbidden]: 'Forbidden',
   [ResponseType.XRPCNotSupported]: 'XRPCNotSupported',
   [ResponseType.PayloadTooLarge]: 'PayloadTooLarge',
+  [ResponseType.UnsupportedMediaType]: 'UnsupportedMediaType',
   [ResponseType.RateLimitExceeded]: 'RateLimitExceeded',
   [ResponseType.InternalServerError]: 'InternalServerError',
   [ResponseType.MethodNotImplemented]: 'MethodNotImplemented',
   [ResponseType.UpstreamFailure]: 'UpstreamFailure',
-  [ResponseType.NotEnoughResouces]: 'NotEnoughResouces',
+  [ResponseType.NotEnoughResources]: 'NotEnoughResources',
   [ResponseType.UpstreamTimeout]: 'UpstreamTimeout',
 }
 
+export function httpResponseCodeToName(status: number): string {
+  return ResponseTypeNames[httpResponseCodeToEnum(status)]
+}
+
 export const ResponseTypeStrings = {
+  [ResponseType.Unknown]: 'Unknown',
   [ResponseType.InvalidResponse]: 'Invalid Response',
   [ResponseType.Success]: 'Success',
   [ResponseType.InvalidRequest]: 'Invalid Request',
@@ -69,32 +89,87 @@ export const ResponseTypeStrings = {
   [ResponseType.Forbidden]: 'Forbidden',
   [ResponseType.XRPCNotSupported]: 'XRPC Not Supported',
   [ResponseType.PayloadTooLarge]: 'Payload Too Large',
+  [ResponseType.UnsupportedMediaType]: 'Unsupported Media Type',
   [ResponseType.RateLimitExceeded]: 'Rate Limit Exceeded',
   [ResponseType.InternalServerError]: 'Internal Server Error',
   [ResponseType.MethodNotImplemented]: 'Method Not Implemented',
   [ResponseType.UpstreamFailure]: 'Upstream Failure',
-  [ResponseType.NotEnoughResouces]: 'Not Enough Resouces',
+  [ResponseType.NotEnoughResources]: 'Not Enough Resources',
   [ResponseType.UpstreamTimeout]: 'Upstream Timeout',
+}
+
+export function httpResponseCodeToString(status: number): string {
+  return ResponseTypeStrings[httpResponseCodeToEnum(status)]
 }
 
 export class XRPCResponse {
   success = true
 
-  constructor(public data: any, public headers: Headers) {}
+  constructor(
+    public data: any,
+    public headers: HeadersMap,
+  ) {}
 }
 
 export class XRPCError extends Error {
   success = false
 
+  public status: ResponseType
+
   constructor(
-    public status: ResponseType,
-    public error?: string,
+    statusCode: number,
+    public error: string = httpResponseCodeToName(statusCode),
     message?: string,
+    public headers?: HeadersMap,
+    options?: ErrorOptions,
   ) {
-    super(message || error || ResponseTypeStrings[status])
-    if (!this.error) {
-      this.error = ResponseTypeNames[status]
+    super(message || error || httpResponseCodeToString(statusCode), options)
+
+    this.status = httpResponseCodeToEnum(statusCode)
+
+    // Pre 2022 runtimes won't handle the "options" constructor argument
+    const cause = options?.cause
+    if (this.cause === undefined && cause !== undefined) {
+      this.cause = cause
     }
+  }
+
+  static from(cause: unknown, fallbackStatus?: ResponseType): XRPCError {
+    if (cause instanceof XRPCError) {
+      return cause
+    }
+
+    // Type cast the cause to an Error if it is one
+    const causeErr = cause instanceof Error ? cause : undefined
+
+    // Try and find a Response object in the cause
+    const causeResponse: Response | undefined =
+      cause instanceof Response
+        ? cause
+        : cause?.['response'] instanceof Response
+          ? cause['response']
+          : undefined
+
+    const statusCode: unknown =
+      // Extract status code from "http-errors" like errors
+      causeErr?.['statusCode'] ??
+      causeErr?.['status'] ??
+      // Use the status code from the response object as fallback
+      causeResponse?.status
+
+    // Convert the status code to a ResponseType
+    const status: ResponseType =
+      typeof statusCode === 'number'
+        ? httpResponseCodeToEnum(statusCode)
+        : fallbackStatus ?? ResponseType.Unknown
+
+    const message = causeErr?.message ?? String(cause)
+
+    const headers = causeResponse
+      ? Object.fromEntries(causeResponse.headers.entries())
+      : undefined
+
+    return new XRPCError(status, undefined, message, headers, { cause })
   }
 }
 
@@ -108,6 +183,8 @@ export class XRPCInvalidResponseError extends XRPCError {
       ResponseType.InvalidResponse,
       ResponseTypeStrings[ResponseType.InvalidResponse],
       `The server gave an invalid response and may be out of date.`,
+      undefined,
+      { cause: validationError },
     )
   }
 }

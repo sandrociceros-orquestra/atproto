@@ -1,32 +1,55 @@
 import { z } from 'zod'
-import { schema as common, def as commonDef } from '@atproto/common'
+import { def as commonDef } from '@atproto/common-web'
+import { schema as common } from '@atproto/common'
 import { CID } from 'multiformats'
 import BlockMap from './block-map'
 import { RepoRecord } from '@atproto/lexicon'
+import CidSet from './cid-set'
 
 // Repo nodes
 // ---------------
 
 const unsignedCommit = z.object({
   did: z.string(),
-  version: z.number(),
-  prev: common.cid.nullable(),
+  version: z.literal(3),
   data: common.cid,
+  rev: z.string(),
+  // `prev` added for backwards compatibility with v2, no requirement of keeping around history
+  prev: common.cid.nullable(),
 })
 export type UnsignedCommit = z.infer<typeof unsignedCommit> & { sig?: never }
 
 const commit = z.object({
   did: z.string(),
-  version: z.number(),
-  prev: common.cid.nullable(),
+  version: z.literal(3),
   data: common.cid,
+  rev: z.string(),
+  prev: common.cid.nullable(),
   sig: common.bytes,
 })
 export type Commit = z.infer<typeof commit>
 
+const legacyV2Commit = z.object({
+  did: z.string(),
+  version: z.literal(2),
+  data: common.cid,
+  rev: z.string().optional(),
+  prev: common.cid.nullable(),
+  sig: common.bytes,
+})
+export type LegacyV2Commit = z.infer<typeof legacyV2Commit>
+
+const versionedCommit = z.discriminatedUnion('version', [
+  commit,
+  legacyV2Commit,
+])
+export type VersionedCommit = z.infer<typeof versionedCommit>
+
 export const schema = {
   ...common,
   commit,
+  legacyV2Commit,
+  versionedCommit,
 }
 
 export const def = {
@@ -34,6 +57,10 @@ export const def = {
   commit: {
     name: 'commit',
     schema: schema.commit,
+  },
+  versionedCommit: {
+    name: 'versioned_commit',
+    schema: schema.versionedCommit,
   },
 }
 
@@ -68,16 +95,25 @@ export type RecordDeleteOp = {
 
 export type RecordWriteOp = RecordCreateOp | RecordUpdateOp | RecordDeleteOp
 
-export type RecordCreateDescript = RecordCreateOp & {
+export type RecordCreateDescript = {
+  action: WriteOpAction.Create
+  collection: string
+  rkey: string
   cid: CID
 }
 
-export type RecordUpdateDescript = RecordUpdateOp & {
+export type RecordUpdateDescript = {
+  action: WriteOpAction.Update
+  collection: string
+  rkey: string
   prev: CID
   cid: CID
 }
 
-export type RecordDeleteDescript = RecordDeleteOp & {
+export type RecordDeleteDescript = {
+  action: WriteOpAction.Delete
+  collection: string
+  rkey: string
   cid: CID
 }
 
@@ -91,26 +127,14 @@ export type WriteLog = RecordWriteDescript[][]
 // Updates/Commits
 // ---------------
 
-export type CommitBlockData = {
-  commit: CID
-  blocks: BlockMap
-}
-
-export type CommitData = CommitBlockData & {
+export type CommitData = {
+  cid: CID
+  rev: string
+  since: string | null
   prev: CID | null
-}
-
-export type RebaseData = {
-  commit: CID
-  rebased: CID
-  blocks: BlockMap
-  preservedCids: CID[]
-}
-
-export type CommitCidData = {
-  commit: CID
-  prev: CID | null
-  cids: CID[]
+  newBlocks: BlockMap
+  relevantBlocks: BlockMap
+  removedCids: CidSet
 }
 
 export type RepoUpdate = CommitData & {
@@ -131,8 +155,32 @@ export type RecordPath = {
   rkey: string
 }
 
+export type RecordCidClaim = {
+  collection: string
+  rkey: string
+  cid: CID | null
+}
+
 export type RecordClaim = {
   collection: string
   rkey: string
   record: RepoRecord | null
+}
+
+// Sync
+// ---------------
+
+export type VerifiedDiff = {
+  writes: RecordWriteDescript[]
+  commit: CommitData
+}
+
+export type VerifiedRepo = {
+  creates: RecordCreateDescript[]
+  commit: CommitData
+}
+
+export type CarBlock = {
+  cid: CID
+  bytes: Uint8Array
 }

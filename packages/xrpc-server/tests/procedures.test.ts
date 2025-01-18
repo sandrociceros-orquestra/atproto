@@ -1,14 +1,15 @@
-import * as http from 'http'
-import { Readable } from 'stream'
-import xrpc, { ServiceClient } from '@atproto/xrpc'
-import getPort from 'get-port'
+import * as http from 'node:http'
+import { Readable } from 'node:stream'
+import { LexiconDoc } from '@atproto/lexicon'
+import { XrpcClient } from '@atproto/xrpc'
 import { createServer, closeServer } from './_util'
 import * as xrpcServer from '../src'
+import { AddressInfo } from 'node:net'
 
-const LEXICONS = [
+const LEXICONS: LexiconDoc[] = [
   {
     lexicon: 1,
-    id: 'io.example.ping1',
+    id: 'io.example.pingOne',
     defs: {
       main: {
         type: 'procedure',
@@ -26,7 +27,7 @@ const LEXICONS = [
   },
   {
     lexicon: 1,
-    id: 'io.example.ping2',
+    id: 'io.example.pingTwo',
     defs: {
       main: {
         type: 'procedure',
@@ -41,7 +42,7 @@ const LEXICONS = [
   },
   {
     lexicon: 1,
-    id: 'io.example.ping3',
+    id: 'io.example.pingThree',
     defs: {
       main: {
         type: 'procedure',
@@ -56,7 +57,7 @@ const LEXICONS = [
   },
   {
     lexicon: 1,
-    id: 'io.example.ping4',
+    id: 'io.example.pingFour',
     defs: {
       main: {
         type: 'procedure',
@@ -84,17 +85,17 @@ const LEXICONS = [
 describe('Procedures', () => {
   let s: http.Server
   const server = xrpcServer.createServer(LEXICONS)
-  server.method('io.example.ping1', (ctx: { params: xrpcServer.Params }) => {
+  server.method('io.example.pingOne', (ctx: { params: xrpcServer.Params }) => {
     return { encoding: 'text/plain', body: ctx.params.message }
   })
   server.method(
-    'io.example.ping2',
+    'io.example.pingTwo',
     (ctx: { params: xrpcServer.Params; input?: xrpcServer.HandlerInput }) => {
       return { encoding: 'text/plain', body: ctx.input?.body }
     },
   )
   server.method(
-    'io.example.ping3',
+    'io.example.pingThree',
     async (ctx: {
       params: xrpcServer.Params
       input?: xrpcServer.HandlerInput
@@ -112,7 +113,7 @@ describe('Procedures', () => {
     },
   )
   server.method(
-    'io.example.ping4',
+    'io.example.pingFour',
     (ctx: { params: xrpcServer.Params; input?: xrpcServer.HandlerInput }) => {
       return {
         encoding: 'application/json',
@@ -120,27 +121,26 @@ describe('Procedures', () => {
       }
     },
   )
-  xrpc.addLexicons(LEXICONS)
 
-  let client: ServiceClient
+  let client: XrpcClient
   beforeAll(async () => {
-    const port = await getPort()
-    s = await createServer(port, server)
-    client = xrpc.service(`http://localhost:${port}`)
+    s = await createServer(server)
+    const { port } = s.address() as AddressInfo
+    client = new XrpcClient(`http://localhost:${port}`, LEXICONS)
   })
   afterAll(async () => {
     await closeServer(s)
   })
 
   it('serves requests', async () => {
-    const res1 = await client.call('io.example.ping1', {
+    const res1 = await client.call('io.example.pingOne', {
       message: 'hello world',
     })
     expect(res1.success).toBeTruthy()
     expect(res1.headers['content-type']).toBe('text/plain; charset=utf-8')
     expect(res1.data).toBe('hello world')
 
-    const res2 = await client.call('io.example.ping2', {}, 'hello world', {
+    const res2 = await client.call('io.example.pingTwo', {}, 'hello world', {
       encoding: 'text/plain',
     })
     expect(res2.success).toBeTruthy()
@@ -148,7 +148,7 @@ describe('Procedures', () => {
     expect(res2.data).toBe('hello world')
 
     const res3 = await client.call(
-      'io.example.ping3',
+      'io.example.pingThree',
       {},
       new TextEncoder().encode('hello world'),
       { encoding: 'application/octet-stream' },
@@ -158,7 +158,7 @@ describe('Procedures', () => {
     expect(new TextDecoder().decode(res3.data)).toBe('hello world')
 
     const res4 = await client.call(
-      'io.example.ping4',
+      'io.example.pingFour',
       {},
       { message: 'hello world' },
     )

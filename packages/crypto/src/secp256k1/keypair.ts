@@ -1,8 +1,13 @@
-import * as secp from '@noble/secp256k1'
-import * as uint8arrays from 'uint8arrays'
-import { SupportedEncodings } from 'uint8arrays/util/bases'
-import * as did from '../did'
+import { secp256k1 as k256 } from '@noble/curves/secp256k1'
+import { sha256 } from '@noble/hashes/sha256'
+import {
+  fromString as ui8FromString,
+  toString as ui8ToString,
+} from 'uint8arrays'
+import { SupportedEncodings } from 'uint8arrays/to-string'
+
 import { SECP256K1_JWT_ALG } from '../const'
+import * as did from '../did'
 import { Keypair } from '../types'
 
 export type Secp256k1KeypairOptions = {
@@ -13,15 +18,18 @@ export class Secp256k1Keypair implements Keypair {
   jwtAlg = SECP256K1_JWT_ALG
   private publicKey: Uint8Array
 
-  constructor(private privateKey: Uint8Array, private exportable: boolean) {
-    this.publicKey = secp.getPublicKey(privateKey)
+  constructor(
+    private privateKey: Uint8Array,
+    private exportable: boolean,
+  ) {
+    this.publicKey = k256.getPublicKey(privateKey)
   }
 
   static async create(
     opts?: Partial<Secp256k1KeypairOptions>,
   ): Promise<Secp256k1Keypair> {
     const { exportable = false } = opts || {}
-    const privKey = secp.utils.randomPrivateKey()
+    const privKey = k256.utils.randomPrivateKey()
     return new Secp256k1Keypair(privKey, exportable)
   }
 
@@ -31,9 +39,7 @@ export class Secp256k1Keypair implements Keypair {
   ): Promise<Secp256k1Keypair> {
     const { exportable = false } = opts || {}
     const privKeyBytes =
-      typeof privKey === 'string'
-        ? uint8arrays.fromString(privKey, 'hex')
-        : privKey
+      typeof privKey === 'string' ? ui8FromString(privKey, 'hex') : privKey
     return new Secp256k1Keypair(privKeyBytes, exportable)
   }
 
@@ -42,7 +48,7 @@ export class Secp256k1Keypair implements Keypair {
   }
 
   publicKeyStr(encoding: SupportedEncodings = 'base64pad'): string {
-    return uint8arrays.toString(this.publicKey, encoding)
+    return ui8ToString(this.publicKey, encoding)
   }
 
   did(): string {
@@ -50,9 +56,10 @@ export class Secp256k1Keypair implements Keypair {
   }
 
   async sign(msg: Uint8Array): Promise<Uint8Array> {
-    const msgHash = await secp.utils.sha256(msg)
+    const msgHash = await sha256(msg)
     // return raw 64 byte sig not DER-encoded
-    return secp.sign(msgHash, this.privateKey, { der: false })
+    const sig = await k256.sign(msgHash, this.privateKey, { lowS: true })
+    return sig.toCompactRawBytes()
   }
 
   async export(): Promise<Uint8Array> {

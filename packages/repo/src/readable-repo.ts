@@ -1,11 +1,12 @@
 import { CID } from 'multiformats/cid'
-import { Commit, def, RepoContents } from './types'
+import { def, RepoContents, Commit } from './types'
 import { ReadableBlockstore } from './storage'
 import { MST } from './mst'
 import log from './logger'
 import * as util from './util'
 import * as parse from './parse'
 import { MissingBlocksError } from './error'
+import { RepoRecord } from '@atproto/lexicon'
 
 type Params = {
   storage: ReadableBlockstore
@@ -28,13 +29,13 @@ export class ReadableRepo {
   }
 
   static async load(storage: ReadableBlockstore, commitCid: CID) {
-    const commit = await storage.readObj(commitCid, def.commit)
+    const commit = await storage.readObj(commitCid, def.versionedCommit)
     const data = await MST.load(storage, commit.data)
     log.info({ did: commit.did }, 'loaded repo for')
     return new ReadableRepo({
       storage,
       data,
-      commit,
+      commit: util.ensureV3Commit(commit),
       cid: commitCid,
     })
   }
@@ -45,6 +46,19 @@ export class ReadableRepo {
 
   get version(): number {
     return this.commit.version
+  }
+
+  async *walkRecords(from?: string): AsyncIterable<{
+    collection: string
+    rkey: string
+    cid: CID
+    record: RepoRecord
+  }> {
+    for await (const leaf of this.data.walkLeavesFrom(from ?? '')) {
+      const { collection, rkey } = util.parseDataKey(leaf.key)
+      const record = await this.storage.readRecord(leaf.value)
+      yield { collection, rkey, cid: leaf.value, record }
+    }
   }
 
   async getRecord(collection: string, rkey: string): Promise<unknown | null> {

@@ -7,8 +7,9 @@ import describeRepo from './describeRepo'
 import getRecord from './getRecord'
 import listRecords from './listRecords'
 import putRecord from './putRecord'
-import rebaseRepo from './rebaseRepo'
 import uploadBlob from './uploadBlob'
+import listMissingBlobs from './listMissingBlobs'
+import importRepo from './importRepo'
 
 export default function (server: Server, ctx: AppContext) {
   applyWrites(server, ctx)
@@ -18,6 +19,7 @@ export default function (server: Server, ctx: AppContext) {
   getRecord(server, ctx)
   listRecords(server, ctx)
   putRecord(server, ctx)
-  rebaseRepo(server, ctx)
   uploadBlob(server, ctx)
+  listMissingBlobs(server, ctx)
+  importRepo(server, ctx)
 }

@@ -1,7 +1,7 @@
 import { Server } from '../../../../lexicon'
 import AppContext from '../../../../context'
-import updateSeen from './updateSeen'
+import registerPush from './registerPush'
 
 export default function (server: Server, ctx: AppContext) {
-  updateSeen(server, ctx)
+  registerPush(server, ctx)
 }

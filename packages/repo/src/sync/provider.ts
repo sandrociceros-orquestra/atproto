@@ -3,14 +3,14 @@ import { BlockWriter } from '@ipld/car/writer'
 import { CID } from 'multiformats/cid'
 import CidSet from '../cid-set'
 import { MissingBlocksError } from '../error'
-import { RepoStorage } from '../storage'
+import { ReadableBlockstore, RepoStorage } from '../storage'
 import * as util from '../util'
 import { MST } from '../mst'
 
-// Checkouts
+// Full Repo
 // -------------
 
-export const getCheckout = (
+export const getFullRepo = (
   storage: RepoStorage,
   commitCid: CID,
 ): AsyncIterable<Uint8Array> => {
@@ -22,49 +22,11 @@ export const getCheckout = (
   })
 }
 
-// Commits
-// -------------
-
-export const getCommits = (
-  storage: RepoStorage,
-  latest: CID,
-  earliest: CID | null,
-): AsyncIterable<Uint8Array> => {
-  return util.writeCar(latest, (car: BlockWriter) => {
-    return writeCommitsToCarStream(storage, car, latest, earliest)
-  })
-}
-
-export const getFullRepo = (
-  storage: RepoStorage,
-  cid: CID,
-): AsyncIterable<Uint8Array> => {
-  return getCommits(storage, cid, null)
-}
-
-export const writeCommitsToCarStream = async (
-  storage: RepoStorage,
-  car: BlockWriter,
-  latest: CID,
-  earliest: CID | null,
-): Promise<void> => {
-  const commits = await storage.getCommits(latest, earliest)
-  if (commits === null) {
-    throw new Error('Could not find shared history')
-  }
-  if (commits.length === 0) return
-  for (const commit of commits) {
-    for (const entry of commit.blocks.entries()) {
-      await car.put(entry)
-    }
-  }
-}
-
 // Narrow slices
 // -------------
 
 export const getRecords = (
-  storage: RepoStorage,
+  storage: ReadableBlockstore,
   commitCid: CID,
   paths: RecordPath[],
 ): AsyncIterable<Uint8Array> => {

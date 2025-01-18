@@ -6,10 +6,11 @@ import { ValidationResult, BlobRef } from '@atproto/lexicon'
 import { lexicons } from '../../../../lexicons'
 import { isObj, hasProp } from '../../../../util'
 import { CID } from 'multiformats/cid'
-import { HandlerAuth } from '@atproto/xrpc-server'
+import { HandlerAuth, HandlerPipeThrough } from '@atproto/xrpc-server'
 import * as AppBskyActorDefs from './defs'
 
 export interface QueryParams {
+  /** Handle or DID of account to fetch profile of. */
   actor: string
 }
 
@@ -20,6 +21,7 @@ export type HandlerInput = undefined
 export interface HandlerSuccess {
   encoding: 'application/json'
   body: OutputSchema
+  headers?: { [key: string]: string }
 }
 
 export interface HandlerError {
@@ -27,11 +29,14 @@ export interface HandlerError {
   message?: string
 }
 
-export type HandlerOutput = HandlerError | HandlerSuccess
-export type Handler<HA extends HandlerAuth = never> = (ctx: {
+export type HandlerOutput = HandlerError | HandlerSuccess | HandlerPipeThrough
+export type HandlerReqCtx<HA extends HandlerAuth = never> = {
   auth: HA
   params: QueryParams
   input: HandlerInput
   req: express.Request
   res: express.Response
-}) => Promise<HandlerOutput> | HandlerOutput
+}
+export type Handler<HA extends HandlerAuth = never> = (
+  ctx: HandlerReqCtx<HA>,
+) => Promise<HandlerOutput> | HandlerOutput
